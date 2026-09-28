@@ -83,13 +83,18 @@ async function withCapturedError<T>(fn: () => Promise<T>): Promise<{ result: T; 
 }
 
 async function withRetries<T>(value: string, fn: () => Promise<T>): Promise<T> {
-  const orig = process.env.GRAFT_LLM_RETRIES;
-  process.env.GRAFT_LLM_RETRIES = value;
+  return withEnv("GRAFT_LLM_RETRIES", value, fn);
+}
+
+/** Set one env var for the duration of `fn`, restoring whatever it held. */
+async function withEnv<T>(name: string, value: string, fn: () => Promise<T>): Promise<T> {
+  const orig = process.env[name];
+  process.env[name] = value;
   try {
     return await fn();
   } finally {
-    if (orig === undefined) delete process.env.GRAFT_LLM_RETRIES;
-    else process.env.GRAFT_LLM_RETRIES = orig;
+    if (orig === undefined) delete process.env[name];
+    else process.env[name] = orig;
   }
 }
 
@@ -273,6 +278,109 @@ test("openai: a second instance of the same endpoint + model skips the forced ru
   assert.equal(first.calls.length, 3);
   assert.equal(second.calls.length, 1);
   assert.equal(second.calls[0].tool_choice, "auto");
+});
+
+const MULTI_TOOL_REQ: ChatRequest = {
+  messages: [{ role: "user", content: "go" }],
+  tools: [
+    { name: "record_graph", description: "d", parameters: { type: "object" } },
+    { name: "draw_diagram", description: "d", parameters: { type: "object" } },
+  ],
+  responseFormat: { kind: "tool", name: "record_graph" },
+};
+
+test("openai: two ladder-rescued calls teach the model to go straight to auto", async () => {
+  // A rescued call: every forced-family rung answered with an errored body and
+  // the "auto" rung then answered. One of those is a hiccup; the pattern
+  // repeating on a second call is the endpoint, not the upstream.
+  const { client, calls } = stubClient(
+    erroredBody(), erroredBody(), toolBody("record_graph", { nodes: [1] }), // call 1: rescued
+    erroredBody(), erroredBody(), toolBody("record_graph", { nodes: [2] }), // call 2: rescued again
+    toolBody("record_graph", { nodes: [3] }), // call 3: no ladder left to walk
+  );
+  const { sleep } = instantSleep();
+  const m = new OpenAIChatModel({ apiKey: "x", model: "learns-from-errors", client, sleep });
+
+  const first = await withCapturedError(() => m.create(TOOL_REQ));
+  assert.equal(calls.length, 3); // still probing: one rescued call proves nothing
+  assert.equal(first.err.length, 0);
+
+  const second = await withCapturedError(() => m.create(TOOL_REQ));
+  assert.equal(calls.length, 6); // the second rescue is what makes the pattern
+  assert.equal(second.err.length, 1); // the switch is announced, once, here
+
+  const third = await withCapturedError(() => m.create(TOOL_REQ));
+  assert.equal(calls.length, 7); // the third call asks once
+  assert.equal(calls[6].tool_choice, "auto");
+  assert.deepEqual(third.result.toolCalls[0].args, { nodes: [3] });
+  assert.equal(third.err.length, 0);
+});
+
+test("openai: one rescued call plus one clean forced success does not switch the model", async () => {
+  const { client, calls } = stubClient(
+    erroredBody(), erroredBody(), toolBody("record_graph", { nodes: [1] }), // rescued once
+    toolBody("record_graph", { nodes: [2] }), // forced works again — the hiccup is forgiven
+    erroredBody(), erroredBody(), toolBody("record_graph", { nodes: [3] }), // this rescue is the first again
+  );
+  const { sleep } = instantSleep();
+  const m = new OpenAIChatModel({ apiKey: "x", model: "reset-by-success", client, sleep });
+
+  const first = await withCapturedError(() => m.create(TOOL_REQ));
+  assert.equal(calls.length, 3);
+  assert.equal(first.err.length, 0); // one rescued call is not a verdict
+
+  const second = await withCapturedError(() => m.create(TOOL_REQ));
+  assert.equal(calls.length, 4); // the forced rung answered; no ask was changed
+  assert.deepEqual(calls[3].tool_choice, { type: "function", function: { name: "record_graph" } });
+
+  const third = await withCapturedError(() => m.create(TOOL_REQ));
+  assert.equal(calls.length, 7); // the success reset the count, so this rescue is the first, not the second
+  assert.equal(third.err.length, 0); // and no downgrade was announced
+});
+
+test("openai: a transient errored body followed by a forced success on retry does not count", async () => {
+  // Several tools, so the ladder is forced → auto with no required rung: the
+  // errored body on the first call is rescued, the retry (the next call) is
+  // answered by the forced rung itself, and nothing may be held against the
+  // endpoint afterwards.
+  const { client, calls } = stubClient(
+    erroredBody(), toolBody("record_graph", { nodes: [1] }), // rescued past the errored body
+    toolBody("record_graph", { nodes: [2] }), // the retry: forced succeeds
+    erroredBody(), toolBody("record_graph", { nodes: [3] }), // rescued again — still only once on the count
+  );
+  const { sleep } = instantSleep();
+  const m = new OpenAIChatModel({ apiKey: "x", model: "transient-then-fine", client, sleep });
+
+  const first = await withCapturedError(() => m.create(MULTI_TOOL_REQ));
+  assert.deepEqual(calls.map((c) => c.tool_choice), [{ type: "function", function: { name: "record_graph" } }, "auto"]);
+  assert.equal(first.err.length, 0);
+
+  const second = await withCapturedError(() => m.create(MULTI_TOOL_REQ));
+  assert.deepEqual(calls.slice(2).map((c) => c.tool_choice), [{ type: "function", function: { name: "record_graph" } }]);
+  assert.deepEqual(second.result.toolCalls[0].args, { nodes: [2] });
+
+  const third = await withCapturedError(() => m.create(MULTI_TOOL_REQ));
+  assert.deepEqual(calls.slice(3).map((c) => c.tool_choice), [{ type: "function", function: { name: "record_graph" } }, "auto"]);
+  assert.deepEqual(third.result.toolCalls[0].args, { nodes: [3] });
+  assert.equal(first.err.length + second.err.length + third.err.length, 0); // never marked
+});
+
+test("openai: GRAFT_LLM_FORCED_RESCUES sets how many rescued calls it takes to switch", async () => {
+  const { client, calls } = stubClient(
+    erroredBody(), erroredBody(), toolBody("record_graph", { nodes: [1] }), // the one rescued call
+    toolBody("record_graph", { nodes: [2] }), // every later call asks once, in auto
+  );
+  const { sleep } = instantSleep();
+  const m = new OpenAIChatModel({ apiKey: "x", model: "threshold-one", client, sleep });
+
+  const first = await withEnv("GRAFT_LLM_FORCED_RESCUES", "1", () => withCapturedError(() => m.create(TOOL_REQ)));
+  assert.equal(calls.length, 3);
+  assert.equal(first.err.length, 1); // a single rescued call was enough
+
+  await withCapturedError(() => m.create(TOOL_REQ));
+
+  assert.equal(calls.length, 4);
+  assert.equal(calls[3].tool_choice, "auto");
 });
 
 test("openai: an endpoint that honors the forced tool_choice sees exactly one call, unchanged", async () => {

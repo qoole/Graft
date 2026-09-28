@@ -45,8 +45,36 @@ const CONTENT_CALL_ID = "from-content";
  * than a tool call, keyed `<baseUrl>|<model>`. Process-local on purpose: it
  * describes one gateway's current behaviour, the rung that works costs at most
  * one extra call, and the next run re-probes for free.
+ *
+ * Two observations are proof, because neither survives a retry: a reply the
+ * endpoint did serve that just doesn't carry the asked-for call (prose where a
+ * tool call was forced), and — counted over {@link forcedFallbackThreshold}
+ * separate calls by {@link forcedToolChoiceRescues} — errored bodies on every
+ * forced-family rung of a call that a lower rung then answered.
  */
 const forcedToolChoiceIgnored = new Set<string>();
+
+/**
+ * Rescued calls per `<baseUrl>|<model>`: structured calls where every
+ * forced-family rung failed with an errored body and the final "auto" rung then
+ * answered. One such call is a hiccup — the upstream behind the gateway may
+ * already be back, and a healthy endpoint must not spend the rest of the run
+ * on the slow rungs — so the downgrade waits for
+ * {@link forcedFallbackThreshold} of them, and a forced call that succeeds
+ * resets the count.
+ */
+const forcedToolChoiceRescues = new Map<string, number>();
+
+/**
+ * Rescued calls it takes to stop probing the forced rung on an endpoint +
+ * model (`GRAFT_LLM_FORCED_RESCUES`). Two by default: the first errored body
+ * says the endpoint's upstream blinked; a second call walking the same ladder
+ * to the same answer says the endpoint itself cannot serve the ask.
+ */
+function forcedFallbackThreshold(): number {
+  const raw = Number(process.env.GRAFT_LLM_FORCED_RESCUES);
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 2;
+}
 
 export interface OpenAIChatModelOptions {
   apiKey: string;
@@ -355,6 +383,14 @@ export class OpenAIChatModel implements ChatModel {
    *
    * An endpoint that honours the forced form never sees rung two — the first
    * attempt answers the question and the ladder ends.
+   *
+   * An errored body is a weaker signal than a served-but-wrong reply, since it
+   * may belong to an upstream that a retry would reach, so it never downgrades
+   * on its own: it is counted instead. A call where every forced-family rung
+   * failed that way and the final "auto" rung then answered is a rescue, and
+   * the second rescue with no successful forced call in between is the
+   * endpoint's pattern, not its upstream's — that, and only that, switches
+   * later calls straight to "auto".
    */
   private async structured(base: ChatParams, tool: string, kind: "json" | "tool"): Promise<ChatResponse> {
     const rungs: ToolChoiceMode[] = this.forcedIgnored
@@ -362,6 +398,11 @@ export class OpenAIChatModel implements ChatModel {
       : base.tools?.length === 1
         ? ["forced", "required", "auto"]
         : ["forced", "auto"];
+
+    // How many rungs of this call have answered with an errored body so far.
+    // The rescue judgement needs the whole call: forced-family rungs errored,
+    // and the rung that finally answered being the one below all of them.
+    let erroredAbove = 0;
 
     for (const rung of rungs.slice(0, -1)) {
       let res: ChatResponse;
@@ -371,10 +412,17 @@ export class OpenAIChatModel implements ChatModel {
         // serve, and it costs the same one call.
         res = this.fromResponse(await this.complete(this.attempt(base, rung, tool), false), kind);
       } catch (err) {
-        if (err instanceof ProviderResponseError) continue;
-        throw err;
+        if (!(err instanceof ProviderResponseError)) throw err;
+        erroredAbove += 1;
+        continue;
       }
-      if (this.delivered(res, kind, tool)) return fromContentAsPayload(res, kind, tool);
+      if (this.delivered(res, kind, tool)) {
+        // The forced rung answering is the strongest counter-evidence there
+        // is: whatever errored bodies came before, this endpoint serves the
+        // ask, and the count starts over.
+        if (rung === "forced") forcedToolChoiceRescues.delete(this.choiceKey);
+        return fromContentAsPayload(res, kind, tool);
+      }
       this.rememberForcedIgnored();
     }
 
@@ -383,6 +431,7 @@ export class OpenAIChatModel implements ChatModel {
     // `content` when that is where it landed, the raw reply otherwise, so the
     // caller's own miss classification still sees exactly what the model said.
     const last = this.fromResponse(await this.complete(this.attempt(base, "auto", tool), true), kind);
+    if (this.delivered(last, kind, tool) && erroredAbove === rungs.length - 1) this.noteForcedRescue();
     return fromContentAsPayload(last, kind, tool);
   }
 
@@ -400,14 +449,28 @@ export class OpenAIChatModel implements ChatModel {
   }
 
   /**
+   * One more rescued call for this endpoint + model. When the count reaches
+   * the threshold with no successful forced call in between, the endpoint is
+   * marked the same way a served-but-wrong reply marks it.
+   */
+  private noteForcedRescue(): void {
+    if (this.forcedIgnored) return;
+    const rescues = (forcedToolChoiceRescues.get(this.choiceKey) ?? 0) + 1;
+    forcedToolChoiceRescues.set(this.choiceKey, rescues);
+    if (rescues >= forcedFallbackThreshold()) this.rememberForcedIgnored();
+  }
+
+  /**
    * Remember, for this process, that the endpoint did not answer a forced
    * `tool_choice` with a tool call, so later requests go straight to the rung
-   * that works. Logged once per endpoint + model: it changes the bytes on the
-   * wire, which is exactly what someone reading a failing build needs told.
+   * that works. Logged once per endpoint + model — the set is shared by every
+   * instance, so a second adapter for the same endpoint never repeats it: it
+   * changes the bytes on the wire, which is exactly what someone reading a
+   * failing build needs told.
    */
   private rememberForcedIgnored(): void {
-    if (this.forcedIgnored) return;
     this.forcedIgnored = true;
+    if (forcedToolChoiceIgnored.has(this.choiceKey)) return;
     forcedToolChoiceIgnored.add(this.choiceKey);
     console.error(
       `⚠ ${this.label}: the endpoint did not honor a forced tool_choice — asking for the tool in the prompt instead (tool_choice "auto") for the rest of this run.`,
