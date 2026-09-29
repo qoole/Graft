@@ -21,7 +21,7 @@
  */
 import OpenAI from "openai";
 import { transportRetries } from "./types.js";
-import { unwrapMarkdownFence } from "./recover-tool.js";
+import { isTruncatedStop, unwrapMarkdownFence } from "./recover-tool.js";
 import type { ChatModel, ChatRequest, ChatResponse, Message, ToolCall, ToolSpec, Usage } from "./types.js";
 
 const PROVIDER = "openai";
@@ -36,6 +36,29 @@ const EMPTY_RESPONSE_BACKOFF_MS = [500, 1000, 2000, 4000, 8000];
 
 /** How many nested emulated `{name, parameters}` wrappers to unwrap before stopping. */
 const MAX_UNWRAP_DEPTH = 2;
+
+/**
+ * One length-boosted re-send: ×4 the caller's output allowance, capped. A
+ * reasoning model that spent the whole allowance thinking needs room for the
+ * answer too, but an allowance past the endpoint's own maximum just turns the
+ * rescue into a 400.
+ */
+const LENGTH_RETRY_MULTIPLIER = 4;
+const LENGTH_RETRY_CAP_TOKENS = 32_768;
+
+/**
+ * The reasoning effort a length-boosted re-send asks for. `low` is the
+ * measured fix (2026-09-29: the same synthesis run went from 0 concept nodes
+ * to 56 when the retry sent `{"reasoning":{"effort":"low"}}`);
+ * `GRAFT_REASONING_EFFORT` overrides it for endpoints that want another
+ * value, and `off` (or `none`) omits the knob entirely for endpoints that
+ * reject it even on the fallback.
+ */
+function reasoningEffortForRetry(): string | null {
+  const raw = process.env.GRAFT_REASONING_EFFORT?.trim().toLowerCase();
+  if (!raw) return "low";
+  return raw === "off" || raw === "none" ? null : raw;
+}
 
 /** Stand-in id for a payload lifted out of `content` — no wire call ever had one. */
 const CONTENT_CALL_ID = "from-content";
@@ -391,6 +414,14 @@ export class OpenAIChatModel implements ChatModel {
    * the second rescue with no successful forced call in between is the
    * endpoint's pattern, not its upstream's — that, and only that, switches
    * later calls straight to "auto".
+   *
+   * A reply cut off at `finish_reason: "length"` with no usable output is its
+   * own case, orthogonal to the ladder: a reasoning model that spent the whole
+   * output allowance thinking was never served a real answer, so each rung
+   * re-sends once with a larger allowance and a low reasoning effort (see
+   * {@link OpenAIChatModel.retryWithLargerAllowance}) before the rung is
+   * judged — and a length stop, boosted or not, is never read as evidence
+   * about `tool_choice`.
    */
   private async structured(base: ChatParams, tool: string, kind: "json" | "tool"): Promise<ChatResponse> {
     const rungs: ToolChoiceMode[] = this.forcedIgnored
@@ -416,6 +447,11 @@ export class OpenAIChatModel implements ChatModel {
         erroredAbove += 1;
         continue;
       }
+      if (!this.delivered(res, kind, tool) && isTruncatedStop(res.stopReason)) {
+        // Cut off mid-think with nothing written: one re-send with room for
+        // the answer and less thinking, before this rung is judged at all.
+        res = await this.retryWithLargerAllowance(this.attempt(base, rung, tool), kind, false);
+      }
       if (this.delivered(res, kind, tool)) {
         // The forced rung answering is the strongest counter-evidence there
         // is: whatever errored bodies came before, this endpoint serves the
@@ -423,16 +459,57 @@ export class OpenAIChatModel implements ChatModel {
         if (rung === "forced") forcedToolChoiceRescues.delete(this.choiceKey);
         return fromContentAsPayload(res, kind, tool);
       }
-      this.rememberForcedIgnored();
+      // A length stop even after the boost is the model running out of output,
+      // not the endpoint ignoring the forced choice — it must not mark it.
+      if (!isTruncatedStop(res.stopReason)) this.rememberForcedIgnored();
     }
 
     // Last rung: "auto" plus the tool named in the prompt, retried on an
     // errored body. Whatever comes back is the answer — the payload from
     // `content` when that is where it landed, the raw reply otherwise, so the
     // caller's own miss classification still sees exactly what the model said.
-    const last = this.fromResponse(await this.complete(this.attempt(base, "auto", tool), true), kind);
+    const autoAttempt = this.attempt(base, "auto", tool);
+    let last = this.fromResponse(await this.complete(autoAttempt, true), kind);
+    if (!this.delivered(last, kind, tool) && isTruncatedStop(last.stopReason)) {
+      last = await this.retryWithLargerAllowance(autoAttempt, kind, true);
+    }
     if (this.delivered(last, kind, tool) && erroredAbove === rungs.length - 1) this.noteForcedRescue();
     return fromContentAsPayload(last, kind, tool);
+  }
+
+  /**
+   * One re-send of a structured ask whose reply ended `finish_reason: "length"`
+   * with nothing usable in it: a reasoning model can spend the whole output
+   * allowance thinking and be cut off before it writes the answer or the tool
+   * call. The re-send quadruples the output allowance (capped) and asks for a
+   * low reasoning effort, which is the part that actually moves such runs. An
+   * endpoint that rejects the reasoning knob gets the same bigger allowance
+   * without it — one bounded fallback, and whatever comes back is the answer.
+   */
+  private async retryWithLargerAllowance(
+    params: ChatParams,
+    kind: "json" | "tool",
+    retryErroredBody: boolean,
+  ): Promise<ChatResponse> {
+    const boosted: ChatParams = {
+      ...params,
+      max_tokens: Math.min(
+        (params.max_tokens ?? LENGTH_RETRY_CAP_TOKENS / LENGTH_RETRY_MULTIPLIER) * LENGTH_RETRY_MULTIPLIER,
+        LENGTH_RETRY_CAP_TOKENS,
+      ),
+    };
+    const effort = reasoningEffortForRetry();
+    if (effort) (boosted as unknown as Record<string, unknown>).reasoning = { effort };
+    try {
+      return this.fromResponse(await this.complete(boosted, retryErroredBody), kind);
+    } catch (err) {
+      // The first send of these exact params minus the two additive fields was
+      // accepted, so a 400 here is one of them being refused — and the only
+      // one worth dropping is the knob, not the room to answer in.
+      if (!(err instanceof OpenAI.APIError) || err.status !== 400 || effort === null) throw err;
+      const { reasoning: _rejected, ...withoutReasoning } = boosted as unknown as Record<string, unknown>;
+      return this.fromResponse(await this.complete(withoutReasoning as unknown as ChatParams, retryErroredBody), kind);
+    }
   }
 
   /** One rung: the forced object form, its equivalent string form, or "auto" plus a prompt. */
