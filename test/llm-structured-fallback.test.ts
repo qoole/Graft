@@ -396,3 +396,62 @@ test("openai: an endpoint that honors the forced tool_choice sees exactly one ca
   assert.deepEqual(result.toolCalls[0].args, { nodes: [1] });
   assert.equal(err.length, 0);
 });
+
+test("openai: errored bodies on every rung of a structured tool call surface as the typed error, never choices[0]", async () => {
+  // The measured crash (`Cannot read properties of undefined (reading '0')`)
+  // came from `choices[0]` on a 200 whose body was `{"error": …}` with no
+  // choices. The gate in complete() must hold on the structured path too,
+  // after the ladder has walked all its rungs.
+  const { client, calls } = stubClient(erroredBody(), erroredBody(), erroredBody());
+  const { sleep } = instantSleep();
+  const m = new OpenAIChatModel({ apiKey: "x", model: "all-rungs-errored", client, sleep });
+
+  const err = await withRetries("0", () =>
+    m.create(TOOL_REQ).then(
+      () => assert.fail("expected the errored bodies to surface"),
+      (e: unknown) => e,
+    ),
+  );
+
+  assert.equal(calls.length, 3, "forced, required, auto — one ask each at GRAFT_LLM_RETRIES=0");
+  assert.ok(isProviderResponseError(err), `expected a ProviderResponseError, got ${String(err)}`);
+  assert.equal(err instanceof TypeError, false);
+  assert.equal(err.message, "Provider returned an empty response");
+});
+
+test("openai: a JSON-format call recovers across errored rungs, and a fatal one stays typed", async () => {
+  // The auto rung answers with the JSON in content: the ladder rescues it and
+  // the caller gets the JSON text json mode asked for.
+  {
+    const { client, calls } = stubClient(erroredBody(), erroredBody(), textBody('{"ok":true}'));
+    const { sleep } = instantSleep();
+    const m = new OpenAIChatModel({ apiKey: "x", model: "json-ladder", client, sleep });
+
+    const { result } = await withCapturedError(() =>
+      m.create({ messages: [{ role: "user", content: "go" }], responseFormat: { kind: "json" } }),
+    );
+
+    assert.deepEqual(calls.map((c) => c.tool_choice), [
+      { type: "function", function: { name: "emit_json" } },
+      "required",
+      "auto",
+    ]);
+    assert.deepEqual(JSON.parse(result.text), { ok: true });
+  }
+  // And when every rung errors, the typed error is what reaches the caller.
+  {
+    const { client } = stubClient(erroredBody(), erroredBody(), erroredBody());
+    const { sleep } = instantSleep();
+    const m = new OpenAIChatModel({ apiKey: "x", model: "json-all-errored", client, sleep });
+
+    const err = await withRetries("0", () =>
+      m.create({ messages: [{ role: "user", content: "go" }], responseFormat: { kind: "json" } }).then(
+        () => assert.fail("expected the errored bodies to surface"),
+        (e: unknown) => e,
+      ),
+    );
+
+    assert.ok(isProviderResponseError(err), `expected a ProviderResponseError, got ${String(err)}`);
+    assert.equal(err instanceof TypeError, false);
+  }
+});
