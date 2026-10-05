@@ -51,6 +51,12 @@ export interface GraphRunOptions {
   lsp?: boolean;
   /** Repo-relative directory prefixes to limit the build to (`--only-dir`). */
   onlyDirs?: string[];
+  /** A still-running `engine.init` pass. When set, this graph build overlaps
+   * it — parse/edges/crux run concurrent with summarize/synthesis — and only
+   * the covers backfill (which mutates the context pass's markdown) waits for
+   * it. A rejection here rejects this graph build, carrying the context
+   * pass's error. */
+  contextSettled?: Promise<BuildResult>;
   onProgress?: GraphBuildOptions["onProgress"];
 }
 
@@ -92,6 +98,7 @@ export class Graft {
    * `opts.llm` is set. Either way the prior meaning layer is preserved.
    */
   graph(dir: string, opts: GraphRunOptions = {}): Promise<GraphBuildResult> {
+    const contextSettled = opts.contextSettled;
     return buildGraph(dir, {
       contextDir: this.cfg.contextDir,
       summarizer: opts.llm ? this.cruxSummarizer() : undefined,
@@ -99,6 +106,11 @@ export class Graft {
       reuse: opts.reuse,
       lsp: opts.lsp,
       onlyDirs: opts.onlyDirs,
+      beforeProjections: contextSettled
+        ? async () => {
+            await contextSettled;
+          }
+        : undefined,
       onProgress: opts.onProgress,
     });
   }

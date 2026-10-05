@@ -65,19 +65,29 @@ export async function runWorkspaceBuild(root: string, opts: WorkspaceBuildOption
     if (Object.keys(childConfigPatch).length > 0) {
       patchBuildConfig(childDir, childConfigPatch);
     }
+    // Every progress line for this child carries its scope until the next.
+    progress.setScope(`[${index + 1}/${total}] ${childName}`);
     const engine = new Graft({ ...opts.childConfig, contextDir: undefined });
     const startedAt = Date.now();
-    if (opts.deep) {
-      await engine.init(childDir, {
-        extensions: opts.extensions,
-        verbose: opts.verbose,
-        onProgress: ({ phase, index: i, total: t, file }) => {
-          progress.phase(phase);
-          progress.tick(i, t, file);
-        },
-      });
-    }
-    const g = await engine.graph(childDir, { llm: opts.deep, concurrency: opts.concurrency });
+    // Deep children overlap their concept pass with the wiring graph, same as
+    // the single-repo path in cli.ts (see `contextSettled` there).
+    const concept =
+      opts.deep ?
+        engine.init(childDir, {
+          extensions: opts.extensions,
+          verbose: opts.verbose,
+          onProgress: ({ phase, index: i, total: t, file }) => {
+            progress.phase(phase);
+            progress.tick(i, t, file);
+          },
+        })
+      : undefined;
+    const g = await engine.graph(childDir, {
+      llm: opts.deep,
+      concurrency: opts.concurrency,
+      contextSettled: concept,
+    });
+    if (concept) await concept;
     const secs = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
     console.log(
       `✓ [${index + 1}/${total}] ${childName}/: ${g.nodes} nodes, ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}] · ${secs}s`,

@@ -8,7 +8,7 @@ import "dotenv/config";
 import { Command } from "commander";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Graft } from "./engine.js";
+import { Graft, type BuildResult } from "./engine.js";
 import { progress } from "./util/progress.js";
 import { resolveConfig, type EngineConfig } from "./ai/providers.js";
 import type { ProviderKind } from "./ai/llm/factory.js";
@@ -533,24 +533,54 @@ program
       return;
     }
 
-    // --deep: concept nodes first, then the wiring graph links cards up to them.
+    // --deep: the concept pass and the wiring graph OVERLAP. The graph build
+    // only truly depends on the concept pass at the covers backfill (which
+    // mutates the concept markdown), so parse/edges/crux run concurrent with
+    // summarize/synthesis and the promise lands there (engine.graph's
+    // `contextSettled` → buildGraph's `beforeCovers`). A concept failure
+    // rejects through the graph await; its catch marks the error as already
+    // tracked so the graph catch below doesn't double-count it.
     let conceptErrors: string[] = [];
     let conceptFatal: string | undefined;
+    let conceptPromise: Promise<BuildResult> | undefined;
     if (deep) {
-      const c = await engine.init(dir, {
-        extensions: opts.extensions,
-        onlyDirs,
-        verbose,
-        onProgress: ({ phase, index, total, file }) => {
-          progress.phase(phase);
-          progress.tick(index, total, file);
-        },
-      }).catch((err: unknown) => {
-        // Only the stage and a code enum; the message stays on this machine.
-        track("build_failed", { stage: "summarize", code: errorCode(err) }, { repo: buildRoot });
-        throw err;
-      });
-      progress.flush();
+      conceptPromise = engine
+        .init(dir, {
+          extensions: opts.extensions,
+          onlyDirs,
+          verbose,
+          onProgress: ({ phase, index, total, file }) => {
+            progress.phase(phase);
+            progress.tick(index, total, file);
+          },
+        })
+        .catch((err: unknown) => {
+          // Only the stage and a code enum; the message stays on this machine.
+          track("build_failed", { stage: "summarize", code: errorCode(err) }, { repo: buildRoot });
+          throw Object.assign(err instanceof Error ? err : new Error(String(err)), { alreadyTracked: true });
+        });
+    }
+
+    // Wiring graph — always; LLM meaning only with --deep.
+    const g = await engine.graph(dir, {
+      llm: deep,
+      concurrency,
+      reuse: opts.reuse,
+      lsp: opts.lsp,
+      onlyDirs,
+      contextSettled: conceptPromise,
+      onProgress: ({ phase, index, total, file }) => {
+        progress.phase(phase);
+        progress.tick(index, total, file);
+      },
+    }).catch((err: unknown) => {
+      if (!(err as { alreadyTracked?: boolean }).alreadyTracked) {
+        track("build_failed", { stage: "graph", code: errorCode(err) }, { repo: buildRoot });
+      }
+      throw err;
+    });
+    if (conceptPromise) {
+      const c = await conceptPromise;
       console.log(
         `✓ concepts: ${c.nodes} nodes, ${c.links} links from ${c.files} files (${c.summarized} read, ${c.cached} cached)`,
       );
@@ -561,22 +591,6 @@ program
       conceptErrors = c.errors;
       conceptFatal = c.fatal;
     }
-
-    // Wiring graph — always; LLM meaning only with --deep.
-    const g = await engine.graph(dir, {
-      llm: deep,
-      concurrency,
-      reuse: opts.reuse,
-      lsp: opts.lsp,
-      onlyDirs,
-      onProgress: ({ phase, index, total, file }) => {
-        progress.phase(phase);
-        progress.tick(index, total, file);
-      },
-    }).catch((err: unknown) => {
-      track("build_failed", { stage: "graph", code: errorCode(err) }, { repo: buildRoot });
-      throw err;
-    });
     progress.flush();
     console.log(`✓ wiring: ${g.nodes} nodes (${fmt(g.byKind)}), ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}]`);
     console.log(`  parsed: ${g.parsed} of ${g.files} files (${g.reused} replayed from cache)`);

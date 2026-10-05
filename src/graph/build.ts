@@ -116,6 +116,13 @@ export interface GraphBuildOptions {
     total: number;
     file: string;
   }) => void;
+  /** Awaited just before the markdown projections, and nowhere earlier. Lets a
+   * caller overlap this graph build with the context pass (whose markdown the
+   * projections read and mutate) without ordering the two: everything up to and
+   * including the crux pass runs concurrent with the context pass; only the
+   * card/index/covers tails are sequenced after it. Unset = projections run in
+   * place, exactly as before. */
+  beforeProjections?: () => Promise<void>;
 }
 
 export interface GraphBuildResult {
@@ -518,6 +525,13 @@ export async function buildGraph(
   // and means a failure here can never be triggered by a query.
   let cardStats: CardStats = { written: 0, pruned: 0, files: [] };
   if (!opts.graphOnly) {
+    // The markdown projections all read or mutate the concept-node markdown the
+    // context pass (`engine.init`) owns: `writeCards` up-links cards to concept
+    // slugs scanned from disk, `writeCovers` stamps covers onto concept files.
+    // When the caller overlaps the two passes, the concept promise lands HERE —
+    // parse/edges/crux ran concurrent with summarize/synthesis, and only these
+    // pure-projection tails are sequenced after it.
+    await opts.beforeProjections?.();
     // The graph is a local, regenerable cache — make sure git ignores it. Cheap and
     // idempotent, so a fresh clone's first build self-ignores.
     ensureGitignored(root, outDir);
