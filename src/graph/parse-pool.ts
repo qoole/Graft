@@ -30,7 +30,8 @@ function workerEntryUrl(): URL {
   const here = new URL(".", import.meta.url);
   const siblingJs = new URL("parse-worker.js", here);
   if (existsSync(siblingJs) && here.href.includes("/dist/")) return siblingJs;
-  const distJs = new URL("../../../dist/graph/parse-worker.js", here);
+  // src/graph/ is two levels under the package root: graph → src → root.
+  const distJs = new URL("../../dist/graph/parse-worker.js", here);
   if (existsSync(distJs)) return distJs;
   if (existsSync(siblingJs)) return siblingJs;
   const srcTs = new URL("parse-worker.ts", here);
