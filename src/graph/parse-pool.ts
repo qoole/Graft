@@ -7,12 +7,31 @@
  * benchmark harness compare the two modes on identical input.
  */
 import { availableParallelism } from "node:os";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import type { ParseJob, ParseOutcome } from "./parse-worker.js";
 
 export type { ParseJob, ParseOutcome } from "./parse-worker.js";
 
 export const DEFAULT_PARSE_WORKERS = 4;
+
+/**
+ * The worker entry sits beside this module — compiled `.js` in `dist/`, `.ts`
+ * under tsx. A `new URL` string is opaque to module resolvers (and tsx's .js→.ts
+ * remap is version-dependent), so look at what is actually on disk instead of
+ * guessing an extension into a string.
+ */
+function workerEntryUrl(): URL {
+  const here = new URL(".", import.meta.url);
+  for (const candidate of ["parse-worker.js", "parse-worker.ts"]) {
+    const url = new URL(candidate, here);
+    if (existsSync(url)) return url;
+  }
+  throw new Error(
+    `parse worker entry not found beside ${fileURLToPath(here)} — run the build first`,
+  );
+}
 
 /** Worker count for `jobCount` cache-miss files. Never more workers than jobs,
  * never more than CPUs; `1` (or an invalid env value) falls back to inline. */
@@ -56,7 +75,14 @@ export async function parseJobsInWorkers(
   return await new Promise<Map<number, ParsedFileResult>>((resolveP, rejectP) => {
     for (let w = 0; w < workerCount; w++) {
       const partition = jobs.filter((_, k) => k % workerCount === w);
-      const worker = new Worker(new URL("./parse-worker.js", import.meta.url));
+      const entry = workerEntryUrl();
+      // A `.ts` entry only exists under tsx, and the loader must be stated for
+      // the worker explicitly — workers don't reliably inherit the parent's
+      // `--import` registration across Node versions (CI's Node 20 didn't,
+      // which is exactly the failure this fixed).
+      const worker = entry.href.endsWith(".ts")
+        ? new Worker(entry, { execArgv: ["--import", "tsx"] })
+        : new Worker(entry);
       workers.push(worker);
       const fail = (err: Error): void => {
         for (const wk of workers) void wk.terminate();
