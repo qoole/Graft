@@ -17,19 +17,26 @@ export type { ParseJob, ParseOutcome } from "./parse-worker.js";
 export const DEFAULT_PARSE_WORKERS = 4;
 
 /**
- * The worker entry sits beside this module — compiled `.js` in `dist/`, `.ts`
- * under tsx. A `new URL` string is opaque to module resolvers (and tsx's .js→.ts
- * remap is version-dependent), so look at what is actually on disk instead of
- * guessing an extension into a string.
+ * The worker entry sits beside this module in the compiled layout (`dist/`),
+ * and tsx keeps this module at `src/graph/` — where the sibling is `.ts`, which
+ * a worker can only load through a TS loader, and loader registration inside
+ * workers varies by Node version (Node 20 refused: ERR_UNKNOWN_FILE_EXTENSION).
+ * A `new URL` string is also opaque to module resolvers, and tsx's own Worker
+ * remap is version-dependent too. So: in dist take the sibling `.js`; in src
+ * point at the compiled `dist/` worker — plain JS, loader-independent, and
+ * always present by test/CLI time because `prepare` builds it.
  */
 function workerEntryUrl(): URL {
   const here = new URL(".", import.meta.url);
-  for (const candidate of ["parse-worker.js", "parse-worker.ts"]) {
-    const url = new URL(candidate, here);
-    if (existsSync(url)) return url;
-  }
+  const siblingJs = new URL("parse-worker.js", here);
+  if (existsSync(siblingJs) && here.href.includes("/dist/")) return siblingJs;
+  const distJs = new URL("../../../dist/graph/parse-worker.js", here);
+  if (existsSync(distJs)) return distJs;
+  if (existsSync(siblingJs)) return siblingJs;
+  const srcTs = new URL("parse-worker.ts", here);
+  if (existsSync(srcTs)) return srcTs;
   throw new Error(
-    `parse worker entry not found beside ${fileURLToPath(here)} — run the build first`,
+    `parse worker entry not found (looked beside ${fileURLToPath(here)} and in dist/) — run the build first`,
   );
 }
 
@@ -76,13 +83,12 @@ export async function parseJobsInWorkers(
     for (let w = 0; w < workerCount; w++) {
       const partition = jobs.filter((_, k) => k % workerCount === w);
       const entry = workerEntryUrl();
-      // A `.ts` entry only exists under tsx, and the loader must be stated for
-      // the worker explicitly — workers don't reliably inherit the parent's
-      // `--import` registration across Node versions (CI's Node 20 didn't,
-      // which is exactly the failure this fixed).
+      // Compiled entries are plain JS — a clean execArgv (no inherited
+      // --test/--import) is the one configuration every supported Node agrees
+      // on. The `.ts` fallback only exists in a tsx tree, so state the loader.
       const worker = entry.href.endsWith(".ts")
         ? new Worker(entry, { execArgv: ["--import", "tsx"] })
-        : new Worker(entry);
+        : new Worker(entry, { execArgv: [] });
       workers.push(worker);
       const fail = (err: Error): void => {
         for (const wk of workers) void wk.terminate();
