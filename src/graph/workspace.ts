@@ -706,6 +706,46 @@ export function federateCallers(
  * building that child standalone (`buildChild` is just `buildGraph(childDir)`),
  * because nothing about the parent path enters the child's build.
  */
+/** Children built in flight at once. Each child is an independent repo with its
+ * own `graft/`, so builds share nothing on disk — the only shared resource is
+ * the machine (the parse pool, item below) and, with `--deep`, the LLM endpoint:
+ * a child's `-j` summarize calls multiply by this limit, so the default stays
+ * modest. `GRAFT_WS_CONCURRENCY=1` restores the strictly sequential build. */
+const DEFAULT_WS_CONCURRENCY = 4;
+
+function wsConcurrency(children: number): number {
+  const raw = process.env.GRAFT_WS_CONCURRENCY;
+  const n = raw === undefined || raw === "" ? DEFAULT_WS_CONCURRENCY : Number(raw);
+  if (!Number.isFinite(n) || n <= 1) return 1;
+  return Math.max(1, Math.min(Math.floor(n), children));
+}
+
+/** Run `fn` over `items` with at most `limit` calls in flight. Unlike a naive
+ * `Promise.all` partition, the first rejection stops NEW work and is rethrown
+ * after the drain, so no in-flight rejection goes unhandled — the build still
+ * aborts on the first failing child, exactly as the sequential loop did. */
+async function mapWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  let firstError: { err: unknown } | undefined;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (firstError === undefined) {
+      const i = next++;
+      if (i >= items.length) return;
+      try {
+        await fn(items[i], i);
+      } catch (err) {
+        firstError ??= { err };
+      }
+    }
+  });
+  await Promise.all(workers);
+  if (firstError) throw firstError.err;
+}
+
 export async function splitWorkspace(
   root: string,
   override: string | undefined,
@@ -715,8 +755,14 @@ export async function splitWorkspace(
   const children = discoverWorkspaceChildren(root).slice().sort();
   const migrated = hasMegaGraph(root, override);
   onStart?.({ children, migrated });
-  for (const [index, child] of children.entries())
+  // Children are sorted before dispatch, so start order matches the sequential
+  // build's; completion interleaves, and each `buildChild` owns its stdout line,
+  // so per-child `✓` lines arrive in completion order. Same abort semantics as
+  // the sequential loop: the first failing child stops the build before
+  // `writeWorkspace`, leaving already-built children on disk.
+  await mapWithConcurrency(children, wsConcurrency(children.length), async (child, index) => {
     await buildChild(join(root, child), child, index, children.length);
+  });
   clearParentGraft(root, override); // drop the mega-graph/.cache/cards…
   writeWorkspace(root, { version: 1, children }, override); // …leaving ONLY workspace.json
   return { children, migrated };
