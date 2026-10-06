@@ -1,36 +1,47 @@
 /**
  * Terminal progress renderer for long build phases, plus LLM call accounting.
  *
- * One output path for build chatter. Two regimes:
+ * Design constraints learned from real workspace runs at WS_CONCURRENCY=50:
  *
- * - Single repo: one scope, one phase stream — TTY draws a self-overwriting
- *   row, a pipe gets heartbeats.
- * - Workspace: children build CONCURRENTLY, so a single last-tick-wins row is
- *   a lie (labels from one child, counters from another). Each child takes a
- *   {@link scope} handle; ticks update that child's entry, and the row shows
- *   AGGREGATES across children (per-phase sums + slowest child + llm in
- *   flight). Per-child detail appears only where it's readable: transition
- *   lines and heartbeats carry the scope prefix, completions print their own
- *   ✓ line.
- *
- * `note()` (errors, warnings) flushes the row first, so a failure can never
- * be repainted away. Every chat completion funnels through `llmBegin()`/
- * `llmEnd()` (installed on the transport in `ai/llm/factory.ts`) to feed the
- * `llm:` summary line: calls, avg seconds per call, total, peak in flight.
+ * - A human glances at the terminal and wants three things: how far along
+ *   overall, what is slow right now, did it stall. Everything else is noise.
+ * - Every number on the row must be MONOTONE. Aggregate denominators shift as
+ *   concurrent children enter/leave phases, so "3456/28865" can drop to
+ *   "786/5955" mid-run — unreadable. The row therefore shows cumulative DONE
+ *   counts only (files summarized, batches synthesized, nodes cruxed), which
+ *   only ever climb.
+ * - The row redraws at most every REDRAW_MS — at -j 50 ticks arrive hundreds
+ *   of times a second and per-tick repaints are a strobe.
+ * - Per-child detail belongs in EVENT lines, not the row: `✓ [12/40] name ·
+ *   38s` completions and (non-TTY/verbose) prefixed phase transitions. In a
+ *   40-child run, 160 `── summarize` lines are spam, so TTY hides them unless
+ *   --verbose.
+ * - `note()` (errors, warnings) flushes the row first: a failure can never be
+ *   repainted away.
+ * - LLM accounting: every chat completion funnels through `llmBegin()`/
+ *   `llmEnd()` (installed on the transport in `ai/llm/factory.ts`) → the
+ *   `llm:` footer: calls, avg seconds per call, total in-llm, peak in flight.
  *
  * One build per process: module state, not a class.
  */
 
+const REDRAW_MS = 250;
 const HEARTBEAT_MS = 30_000;
-const HEARTBEAT_TICKS = 100;
-const MAX_LAGGING_SHOWN = 3;
 
 let quiet = false;
+let verbose = false;
 const tty = process.stderr.isTTY === true;
 
 let dirty = false; // a \r row is on screen
 let startedAt = 0;
 let lastHeartbeatMs = 0;
+let lastDrawMs = 0;
+let lastFile = ""; // single-repo: last tick's file, shown on the row
+
+// Cumulative done-counters per activity — the row's core. Only climb.
+const cumulative: Record<string, number> = {};
+// Per-scope last seen index, per phase — the delta source for `cumulative`.
+const lastIndex = new Map<string, number>(); // key = `${scope}\0${phase}`
 
 // LLM accounting
 let llmCalls = 0;
@@ -43,9 +54,10 @@ interface ScopeState {
   phase: string;
   index: number;
   total: number;
+  file: string;
 }
 
-const scopes = new Map<string, ScopeState>(); // key = label
+const scopes = new Map<string, ScopeState>(); // key = label ("\0single" for one-repo)
 
 function write(s: string): void {
   process.stderr.write(s);
@@ -67,6 +79,7 @@ function flush(): void {
   if (!dirty) return;
   write("\n");
   dirty = false;
+  lastDrawMs = 0; // next tick may draw immediately
 }
 
 /** One full line to stderr — the only sanctioned way to break the row. */
@@ -75,136 +88,158 @@ function fullLine(line: string): void {
   write(`${line}\n`);
 }
 
-/** Aggregate across active scopes, grouped by phase:
- * `summarize 3456/21000 (12) · synthesize 40/300 (3)`, plus the slowest
- * children by fraction remaining. */
-function aggregate(exclude = ""): string {
-  const byPhase = new Map<string, { done: number; total: number; count: number }>();
-  const lagging: { label: string; frac: number; index: number; total: number; phase: string }[] = [];
-  for (const s of scopes.values()) {
-    if (s.total <= 0) continue;
-    const g = byPhase.get(s.phase) ?? { done: 0, total: 0, count: 0 };
-    g.done += s.index + 1;
-    g.total += s.total;
-    g.count++;
-    byPhase.set(s.phase, g);
-    lagging.push({ label: s.label, frac: (s.index + 1) / s.total, index: s.index, total: s.total, phase: s.phase });
-  }
-  const parts = [...byPhase.entries()]
-    .sort((a, b) => b[1].total - a[1].total)
-    .slice(0, 3)
-    .map(([phase, g]) => `${phase} ${g.done}/${g.total} (${g.count})`);
-  lagging.sort((a, b) => a.frac - b.frac);
-  const slow = lagging.filter((l) => l.label !== exclude).slice(0, MAX_LAGGING_SHOWN);
-  const slowPart = slow
-    .map((l) => `${l.label} ${l.index + 1}/${l.total}`)
-    .join(" · ");
-  const llmPart = llmInFlight > 0 ? ` · llm ${llmInFlight}` : "";
-  const base = parts.length > 0 ? parts.join(" · ") : "starting";
-  return slowPart ? `${base} · slowest ${slowPart}${llmPart}` : `${base}${llmPart}`;
+function fmt(n: number): string {
+  return n.toLocaleString("en-US");
 }
 
-function drawRow(): void {
-  const label = scopes.size === 1 ? [...scopes.keys()][0] + " " : "";
-  write(`\r\x1b[K${label}${aggregate(scopes.size === 1 ? [...scopes.keys()][0] : "")}`);
+/** Slowest active child by fraction of its current phase. */
+function slowest(): string {
+  let best: ScopeState | undefined;
+  for (const s of scopes.values()) {
+    if (s.total <= 0 || !s.phase) continue;
+    if (scopes.size === 1) return `${s.label ? `${s.label} ` : ""}${s.phase} ${fmt(s.index + 1)}/${fmt(s.total)}`;
+    const frac = (s.index + 1) / s.total;
+    if (!best || frac < (best.index + 1) / best.total) best = s;
+  }
+  if (!best) return "";
+  return `${best.label} ${phaseName(best.phase)} ${fmt(best.index + 1)}/${fmt(best.total)}`;
+}
+
+/** The row: children done, elapsed, cumulative counters, llm, slowest. */
+function rowText(): string {
+  const parts: string[] = [];
+  if (scopes.size > 1 || [...scopes.keys()][0] !== "\0single") {
+    // Workspace: children still active vs total ever seen (done + active).
+    parts.push(`${scopes.size} active`);
+  }
+  const acts = Object.entries(cumulative).filter(([, n]) => n > 0);
+  for (const [phase, n] of acts) parts.push(`${phase} ${fmt(n)}`);
+  if (llmInFlight > 0) parts.push(`llm ${llmInFlight} in flight`);
+  const slow = slowest();
+  if (slow) parts.push(`slowest ${slow}`);
+  return parts.join(" · ") || "starting";
+}
+
+function draw(force = false): void {
+  if (quiet) return;
+  const now = Date.now();
+  if (!force && now - lastDrawMs < REDRAW_MS) return;
+  lastDrawMs = now;
+  const label = scopes.size === 1 && scopes.has("\0single") && lastFile ? `: ${lastFile.slice(0, 48)}` : "";
+  write(`\r\x1b[K${rowText()}${label}`);
   dirty = true;
 }
 
+function recordTick(scopeKey: string, phase: string, index: number): void {
+  const key = `${scopeKey}\0${phase}`;
+  const prev = lastIndex.get(key);
+  const delta = prev === undefined ? index + 1 : index - prev;
+  lastIndex.set(key, index);
+  if (delta > 0) cumulative[phase] = (cumulative[phase] ?? 0) + delta;
+}
+
+function heartbeatLine(): string {
+  const slow: string[] = [];
+  const arr = [...scopes.values()].filter((s) => s.total > 0);
+  arr.sort((a, b) => (a.index + 1) / a.total - (b.index + 1) / b.total);
+  for (const s of arr.slice(0, 3)) slow.push(`[${s.label}] ${phaseName(s.phase)} ${fmt(s.index + 1)}/${fmt(s.total)}`);
+  return `${rowText()}${slow.length ? ` · ${slow.join(" · ")}` : ""}`;
+}
+
 export interface ProgressScope {
-  /** Phase transition for this child — one prefixed line. */
   phase(rawLabel: string): void;
-  /** Progress tick — updates this child's entry; drives the aggregate row. */
   tick(index: number, total: number, file?: string): void;
-  /** Child finished — drop it from the active set. */
   done(): void;
+}
+
+function makeScope(label: string): ProgressScope {
+  scopes.set(label, { label, phase: "", index: 0, total: 0, file: "" });
+  return {
+    phase(rawLabel: string): void {
+      const st = scopes.get(label);
+      if (!st) return;
+      const next = phaseName(rawLabel);
+      if (next === st.phase) return;
+      st.phase = next;
+      st.index = 0;
+      st.total = 0;
+      if (!tty || verbose) fullLine(`[${label}] ── ${next}`);
+    },
+    tick(index: number, total: number, file?: string): void {
+      const st = scopes.get(label);
+      if (!st) return;
+      st.index = index;
+      st.total = total;
+      if (file) st.file = file;
+      recordTick(label, st.phase, index);
+      const now = Date.now();
+      if (!tty && now - lastHeartbeatMs >= HEARTBEAT_MS) {
+        lastHeartbeatMs = now;
+        fullLine(heartbeatLine());
+        return;
+      }
+      draw();
+    },
+    done(): void {
+      scopes.delete(label);
+      draw(true);
+    },
+  };
 }
 
 export const progress = {
   configure(opts: { quiet?: boolean; verbose?: boolean }): void {
     quiet = opts.quiet === true;
+    verbose = opts.verbose === true;
     startedAt = Date.now();
   },
 
-  /** A concurrent unit (workspace child). Its ticks feed the aggregate row;
-   * its phase transitions and heartbeats carry its own prefix. */
+  /** A concurrent unit (workspace child). */
   scope(label: string): ProgressScope {
-    scopes.set(label, { label, phase: "", index: 0, total: 0 });
-    return {
-      phase(rawLabel: string): void {
-        const st = scopes.get(label);
-        if (!st) return;
-        const next = phaseName(rawLabel);
-        if (next === st.phase) return;
-        st.phase = next;
-        st.index = 0;
-        st.total = 0;
-        if (!quiet) fullLine(`[${label}] ── ${next}`);
-      },
-      tick(index: number, total: number, _file?: string): void {
-        const st = scopes.get(label);
-        if (!st) return;
-        st.index = index;
-        st.total = total;
-        if (quiet) return;
-        const now = Date.now();
-        if (!tty) {
-          if (now - lastHeartbeatMs < HEARTBEAT_MS && index - lastHeartbeatIndexFor(label) < HEARTBEAT_TICKS) return;
-          lastHeartbeatMs = now;
-          noteHeartbeatIndex(label, index);
-          fullLine(`[${label}] ${aggregate()}`);
-          return;
-        }
-        drawRow();
-      },
-      done(): void {
-        scopes.delete(label);
-        if (scopes.size === 0) flush();
-      },
-    };
+    return makeScope(label);
   },
 
   /** Single-stream path (single-repo build): implicit lone scope. */
   phase(rawLabel: string): void {
-    const label = "\0single";
-    let st = scopes.get(label);
-    if (!st) st = scopes.set(label, { label: "", phase: "", index: 0, total: 0 }).get(label)!;
+    let st = scopes.get("\0single");
+    if (!st) st = scopes.set("\0single", { label: "", phase: "", index: 0, total: 0, file: "" }).get("\0single")!;
     const next = phaseName(rawLabel);
     if (next === st.phase) return;
     st.phase = next;
     st.index = 0;
     st.total = 0;
-    if (!quiet) fullLine(`── ${next}`);
+    // Four phases in one build — the transitions carry real information here.
+    fullLine(`── ${next}`);
   },
 
   tick(index: number, total: number, file?: string): void {
-    if (quiet) return;
+    const st = scopes.get("\0single");
+    if (!st) return;
+    st.index = index;
+    st.total = total;
+    if (file) lastFile = file;
+    recordTick("\0single", st.phase, index);
     const now = Date.now();
-    if (!tty) {
-      if (now - lastHeartbeatMs < HEARTBEAT_MS && index - lastHeartbeatIndexFor("\0single") < HEARTBEAT_TICKS) return;
+    if (!tty && now - lastHeartbeatMs >= HEARTBEAT_MS) {
       lastHeartbeatMs = now;
-      noteHeartbeatIndex("\0single", index);
-      const st = scopes.get("\0single");
-      fullLine(`── ${st?.phase ?? "build"} ${index + 1}/${total}${file ? `: ${file}` : ""}`);
+      fullLine(`── ${phaseName(st.phase)} ${fmt(index + 1)}/${fmt(total)}${lastFile ? `: ${lastFile}` : ""}`);
       return;
     }
-    const st = scopes.get("\0single");
-    if (st) {
-      st.index = index;
-      st.total = total;
-    }
-    drawRow();
+    draw();
   },
 
   /** A full stderr line (errors, warnings). Flushes the row first so the
-   * next tick can't repaint over it. console.error so stderr-capturing
-   * tests still see it. */
+   * next tick can't repaint over it. */
   note(line: string): void {
     flush();
     console.error(line);
   },
 
-  /** Newline if a `\r` row is on screen. Call before any direct stderr write. */
+  /** Newline if a `\r` row is on screen. Call before any stdout write too,
+   * so ✓ lines never append to the row. */
   flush,
+  /** Force a row repaint now (bypasses the throttle). */
+  redraw: () => draw(true),
 
   llmBegin(): number {
     llmCalls++;
@@ -219,29 +254,20 @@ export const progress = {
     llmMs += ms;
   },
 
-  /** `  timing: ...` line, or "" when nothing was measured. */
+  /** `  timing: ...` footer line, or "" when nothing was measured. */
   timing(): string {
     const total = Date.now() - startedAt;
     if (total <= 0) return "";
     return `  timing: total ${secondsLabel(total)}`;
   },
 
-  /** `  llm: ...` line, or "" when no calls were made. */
+  /** `  llm: ...` footer line, or "" when no calls were made. */
   llmSummary(): string {
     if (llmCalls === 0) return "";
     const avg = llmMs / llmCalls;
     return (
-      `  llm: ${llmCalls} calls · avg ${secondsLabel(avg)}/call · ${secondsLabel(llmMs)} in llm ` +
+      `  llm: ${fmt(llmCalls)} calls · avg ${secondsLabel(avg)}/call · ${secondsLabel(llmMs)} in llm ` +
       `(peak ${llmMaxInFlight} in flight)`
     );
   },
 };
-
-// Per-scope heartbeat counters (tick spacing is per child, not global).
-const heartbeatIndex = new Map<string, number>();
-function lastHeartbeatIndexFor(key: string): number {
-  return heartbeatIndex.get(key) ?? Number.NEGATIVE_INFINITY;
-}
-function noteHeartbeatIndex(key: string, index: number): void {
-  heartbeatIndex.set(key, index);
-}

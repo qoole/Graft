@@ -10,6 +10,7 @@
  * Anything else (prose, truncated JSON, a guessed shape) returns undefined.
  * Callers MUST run the same schema validation they use for real tool calls.
  */
+import { progress } from "../../util/progress.js";
 
 /** Leading/trailing ```json fence, linear in `raw.length` — no quantified-whitespace regex. */
 function unwrapMarkdownFence(raw: string): string {
@@ -93,11 +94,25 @@ export function recoverToolArgsFromContent(
   return undefined;
 }
 
-/** One stderr line when a structured op got neither a tool call nor recoverable JSON. */
+/** One stderr line when a structured op got neither a tool call nor recoverable
+ * JSON. Deduped per op: a model that ignores tool_choice fails EVERY file, and
+ * 600 identical warnings are the per-failure log's own flood — first occurrence
+ * prints, then every 50th carries the running count. */
+const warnCounts = new Map<string, number>();
+
 export function warnToolChoiceIgnored(op: string, reason: "empty" | "unparsed"): void {
   const detail =
     reason === "empty"
       ? "model returned no tool call and no content (provider may ignore forced tool_choice)"
       : "model did not honor tool_choice and content is not parseable tool-call JSON";
-  console.error(`⚠ ${op}: ${detail} — this batch is empty`);
+  const n = (warnCounts.get(op) ?? 0) + 1;
+  warnCounts.set(op, n);
+  if (n === 1) progress.note(`⚠ ${op}: ${detail} — repeats suppressed (counts in the build summary)`);
+  else if (n % 50 === 0) progress.note(`⚠ ${op}: ${detail} — ×${n} so far`);
+}
+
+/** Test isolation: the dedupe is module state, and node --test shares one
+ * process across files — a suite pinning the first-occurrence line resets. */
+export function resetWarnToolChoiceCountsForTests(): void {
+  warnCounts.clear();
 }

@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { ChatSummarizer } from "../src/ai/summarize.js";
 import { ChatSynthesizer } from "../src/ai/synthesize.js";
 import { ChatCruxSummarizer } from "../src/ai/crux.js";
-import { recoverToolArgsFromContent } from "../src/ai/llm/recover-tool.js";
+import { recoverToolArgsFromContent , resetWarnToolChoiceCountsForTests } from "../src/ai/llm/recover-tool.js";
 import type { ChatModel, ChatRequest, ChatResponse, ToolCall } from "../src/ai/llm/types.js";
 
 /** Records the last request and replays a canned response. */
@@ -116,6 +116,7 @@ test("#129: ChatSynthesizer recovers a single-object wrapper and a fenced JSON p
 });
 
 test("#129: unparseable content warns and does not throw", async () => {
+  resetWarnToolChoiceCountsForTests();
   const m = new FakeChatModel({ text: "The architecture is a layered monolith.", toolCalls: [] });
   const { result: nodes, err } = await withCapturedError(() =>
     new ChatSynthesizer(m).synthesize([{ path: "a.ts", summary: "x" }]),
