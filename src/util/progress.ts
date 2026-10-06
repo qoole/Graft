@@ -97,7 +97,6 @@ function slowest(): string {
   let best: ScopeState | undefined;
   for (const s of scopes.values()) {
     if (s.total <= 0 || !s.phase) continue;
-    if (scopes.size === 1) return `${s.label ? `${s.label} ` : ""}${s.phase} ${fmt(s.index + 1)}/${fmt(s.total)}`;
     const frac = (s.index + 1) / s.total;
     if (!best || frac < (best.index + 1) / best.total) best = s;
   }
@@ -105,13 +104,23 @@ function slowest(): string {
   return `${best.label} ${phaseName(best.phase)} ${fmt(best.index + 1)}/${fmt(best.total)}`;
 }
 
-/** The row: children done, elapsed, cumulative counters, llm, slowest. */
+/** The row. Two shapes:
+ * - single repo: the live phase WITH its denominator (static here, unlike the
+ *   workspace's shifting aggregates) + llm in flight + current file;
+ * - workspace: cumulative counters + active children + slowest child. */
 function rowText(): string {
-  const parts: string[] = [];
-  if (scopes.size > 1 || [...scopes.keys()][0] !== "\0single") {
-    // Workspace: children still active vs total ever seen (done + active).
-    parts.push(`${scopes.size} active`);
+  const single = scopes.size === 1 ? scopes.get("\0single") : undefined;
+  if (single) {
+    if (!single.phase) return "starting";
+    const head =
+      single.total > 0
+        ? `${single.phase} ${fmt(single.index + 1)}/${fmt(single.total)}`
+        : `${single.phase}`;
+    const parts = [head];
+    if (llmInFlight > 0) parts.push(`llm ${llmInFlight} in flight`);
+    return parts.join(" · ");
   }
+  const parts: string[] = [`${scopes.size} active`];
   const acts = Object.entries(cumulative).filter(([, n]) => n > 0);
   for (const [phase, n] of acts) parts.push(`${phase} ${fmt(n)}`);
   if (llmInFlight > 0) parts.push(`llm ${llmInFlight} in flight`);
