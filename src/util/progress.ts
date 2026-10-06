@@ -179,7 +179,7 @@ function makeScope(label: string): ProgressScope {
       st.phase = next;
       st.index = 0;
       st.total = 0;
-      if (!tty || verbose) fullLine(`[${label}] ── ${next}`);
+      if (!tty) fullLine(`[${label}] ── ${next}`);
     },
     tick(index: number, total: number, file?: string): void {
       const st = scopes.get(label);
@@ -224,8 +224,9 @@ export const progress = {
     st.phase = next;
     st.index = 0;
     st.total = 0;
-    // Four phases in one build — the transitions carry real information here.
-    fullLine(`── ${next}`);
+    // The row already names the phase; under the deep overlap the concept and
+    // graph passes alternate every few seconds and transition lines were a
+    // strobe. Non-TTY keeps them (greppable log).
   },
 
   tick(index: number, total: number, file?: string): void {

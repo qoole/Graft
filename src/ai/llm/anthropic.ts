@@ -98,7 +98,7 @@ export class AnthropicChatModel implements ChatModel {
       params.tools = tools;
     }
 
-    const resp = await this.client.messages.create(params);
+    const resp = await this.client.messages.create(params, { timeout: req.timeoutMs ?? transportTimeoutMs() });
     return this.fromResponse(resp, fmt.kind);
   }
 

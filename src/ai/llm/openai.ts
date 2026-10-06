@@ -172,7 +172,7 @@ export class OpenAIChatModel implements ChatModel {
       params.tools = tools;
     }
 
-    const resp = await this.createChatCompletion(params);
+    const resp = await this.createChatCompletion(params, req.timeoutMs);
     return this.fromResponse(resp, fmt.kind);
   }
 
@@ -186,12 +186,12 @@ export class OpenAIChatModel implements ChatModel {
    * caller-specified tool — that ambiguity isn't safe to paper over
    * automatically.
    */
-  private async createChatCompletion(params: ChatParams): Promise<OpenAI.Chat.Completions.ChatCompletion> {
+  private async createChatCompletion(params: ChatParams, timeoutMs?: number): Promise<OpenAI.Chat.Completions.ChatCompletion> {
     let attempt = params;
     // Bounded: one retry per known incompatibility below, never an open loop.
     for (let i = 0; i < 4; i++) {
       try {
-        return await this.client.chat.completions.create(attempt);
+        return await this.client.chat.completions.create(attempt, { timeout: timeoutMs ?? transportTimeoutMs() });
       } catch (err) {
         // Checked before the tool_choice fallback below: a reasoning refusal
         // also names tool_choice, and turning reasoning off keeps the caller's
@@ -217,7 +217,7 @@ export class OpenAIChatModel implements ChatModel {
         throw err;
       }
     }
-    return this.client.chat.completions.create(attempt);
+    return this.client.chat.completions.create(attempt, { timeout: timeoutMs ?? transportTimeoutMs() });
   }
 
   private fromResponse(

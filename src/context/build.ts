@@ -336,8 +336,9 @@ export async function buildContext(dir: string, opts: BuildOptions): Promise<Bui
   let synthCached = 0;
   for (const [b, out] of outcomes.entries()) {
     const links = out.nodes.reduce((n, node) => n + node.links.length, 0);
+    if (out.cached) synthCached++;
     if (out.cached && !opts.verbose) {
-      synthCached++;
+      // counted only; the summary line in the ✓ block reports it
     } else {
       const note = out.cached ? " (cached)" : out.state === "failed" ? " (failed)" : out.state === "skipped" ? " (skipped)" : "";
       progress.note(`  synthesis batch ${b + 1}/${batches.length}: ${out.nodes.length} nodes, ${links} links${note}`);

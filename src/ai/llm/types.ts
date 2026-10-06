@@ -91,6 +91,10 @@ export interface ChatRequest {
   temperature?: number;
   /** Max output tokens. Required by Anthropic; adapters supply a default. */
   maxTokens?: number;
+  /** Per-request transport timeout in ms — overrides the transport default.
+   * Synthesis batches (a whole char-budget of summaries per call) set this
+   * higher than per-file calls: GRAFT_SYNTH_TIMEOUT, default 600s. */
+  timeoutMs?: number;
 }
 
 export interface ChatResponse {

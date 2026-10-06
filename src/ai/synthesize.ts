@@ -125,6 +125,13 @@ function clean(nodes: unknown): SynthNode[] {
 
 const RECORD_TOOL = "record_graph";
 
+/** Per-batch synthesis timeout: GRAFT_SYNTH_TIMEOUT seconds, default 600 —
+ * a reasoning model on a full char-budget batch spends real minutes. */
+function synthTimeoutMs(): number {
+  const raw = Number(process.env.GRAFT_SYNTH_TIMEOUT);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) * 1000 : 600_000;
+}
+
 /** Synthesizer backed by any {@link ChatModel} via forced tool calling. */
 export class ChatSynthesizer implements Synthesizer {
   constructor(private model: ChatModel) {}
@@ -134,6 +141,10 @@ export class ChatSynthesizer implements Synthesizer {
     const res = await this.model.create({
       temperature: 0,
       maxTokens: 8192,
+      // One batch carries a whole char-budget of summaries; a reasoning model
+      // legitimately spends several minutes on it — well past the per-file
+      // timeout. GRAFT_SYNTH_TIMEOUT (seconds), default 600.
+      timeoutMs: synthTimeoutMs(),
       tools: [
         {
           name: RECORD_TOOL,
