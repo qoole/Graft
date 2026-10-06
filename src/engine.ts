@@ -32,6 +32,8 @@ export interface InitOptions {
   onlyDirs?: string[];
   /** Per-batch detail for cached synthesis batches (live batches always print). */
   verbose?: boolean;
+  /** Max concept synthesis batches in flight at once. Default 4. */
+  synthConcurrency?: number;
   /** Progress callback for long builds. */
   onProgress?: (info: BuildProgress) => void;
 }
@@ -73,6 +75,7 @@ export class Graft {
       contextDir: this.cfg.contextDir,
       extensions: opts.extensions,
       onlyDirs: opts.onlyDirs,
+      synthConcurrency: opts.synthConcurrency,
       model: this.modelLabel(),
       summarizer: this.summarizer(),
       synthesizer: this.synthesizer(),

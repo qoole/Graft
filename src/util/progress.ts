@@ -48,6 +48,13 @@ let llmCalls = 0;
 let llmMs = 0;
 let llmInFlight = 0;
 let llmMaxInFlight = 0;
+const llmStarts: number[] = []; // start timestamps of calls still in flight
+
+/** Age of the oldest in-flight call — the "is it moving" signal: climbing
+ * means the model is still thinking; frozen at 0:00 with N>0 means dead. */
+function llmOldest(): number {
+  return llmStarts.length > 0 ? Date.now() - Math.min(...llmStarts) : 0;
+}
 
 interface ScopeState {
   label: string;
@@ -117,13 +124,13 @@ function rowText(): string {
         ? `${single.phase} ${fmt(single.index + 1)}/${fmt(single.total)}`
         : `${single.phase}`;
     const parts = [head];
-    if (llmInFlight > 0) parts.push(`llm ${llmInFlight} in flight`);
+    if (llmInFlight > 0) parts.push(`llm ${llmInFlight} in flight · oldest ${secondsLabel(llmOldest())}`);
     return parts.join(" · ");
   }
   const parts: string[] = [`${scopes.size} active`];
   const acts = Object.entries(cumulative).filter(([, n]) => n > 0);
   for (const [phase, n] of acts) parts.push(`${phase} ${fmt(n)}`);
-  if (llmInFlight > 0) parts.push(`llm ${llmInFlight} in flight`);
+  if (llmInFlight > 0) parts.push(`llm ${llmInFlight} in flight · oldest ${secondsLabel(llmOldest())}`);
   const slow = slowest();
   if (slow) parts.push(`slowest ${slow}`);
   return parts.join(" · ") || "starting";
@@ -253,13 +260,17 @@ export const progress = {
   llmBegin(): number {
     llmCalls++;
     llmInFlight++;
+    const t0 = Date.now();
+    llmStarts.push(t0);
     if (llmInFlight > llmMaxInFlight) llmMaxInFlight = llmInFlight;
-    return Date.now();
+    return t0;
   },
 
   llmEnd(t0: number): void {
     const ms = Date.now() - t0;
     llmInFlight = Math.max(0, llmInFlight - 1);
+    const at = llmStarts.indexOf(t0);
+    if (at >= 0) llmStarts.splice(at, 1);
     llmMs += ms;
   },
 

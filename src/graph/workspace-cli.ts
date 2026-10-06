@@ -30,6 +30,8 @@ export interface WorkspaceBuildOptions {
   concurrency?: number;
   /** Per-batch detail for cached synthesis batches (live batches always print). */
   verbose?: boolean;
+  /** Max concept synthesis batches in flight per child (default 4). */
+  synthConcurrency?: number;
   /** Provider/model/key config for child builds — WITHOUT any contextDir
    * override, so each child writes to its own `<child>/graft/`. */
   childConfig: EngineConfig;
@@ -77,6 +79,7 @@ export async function runWorkspaceBuild(root: string, opts: WorkspaceBuildOption
         engine.init(childDir, {
           extensions: opts.extensions,
           verbose: opts.verbose,
+          synthConcurrency: opts.synthConcurrency,
           onProgress: ({ phase, index: i, total: t }) => {
             prog.phase(phase);
             prog.tick(i, t);
