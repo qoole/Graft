@@ -145,6 +145,7 @@ export class OpenAIChatModel implements ChatModel {
         baseURL: opts.baseUrl,
         defaultHeaders: opts.headers,
         maxRetries: transportRetries(),
+        timeout: transportTimeoutMs(),
       });
   }
 
