@@ -124,3 +124,16 @@ export function transportRetries(): number {
   const raw = Number(process.env.GRAFT_LLM_RETRIES);
   return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 4;
 }
+
+/**
+ * Per-ATTEMPT timeout in ms. Without it the SDKs sit at their 10-minute
+ * default, and one hung connection through the retry ladder reads as a call
+ * that is "16 minutes old and climbing" — minutes of wallclock spent waiting
+ * on a socket that stopped answering. A reasoning model on a full synthesis
+ * batch needs real minutes, so the default is generous (300s); dial it down
+ * (and GRAFT_LLM_RETRIES with it) when your endpoint fails fast instead.
+ */
+export function transportTimeoutMs(): number {
+  const raw = Number(process.env.GRAFT_LLM_TIMEOUT);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) * 1000 : 300_000;
+}

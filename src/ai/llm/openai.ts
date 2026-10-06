@@ -10,7 +10,7 @@
  * input count so {@link Usage.input} is uncached-only.
  */
 import OpenAI from "openai";
-import { transportRetries } from "./types.js";
+import { transportRetries, transportTimeoutMs } from "./types.js";
 import type { ChatModel, ChatRequest, ChatResponse, Message, ToolCall, ToolSpec, Usage } from "./types.js";
 
 const PROVIDER = "openai";
