@@ -581,6 +581,7 @@ program
     });
     if (conceptPromise) {
       const c = await conceptPromise;
+      progress.flush(); // ✓ lines are stdout — never append to the stderr row
       console.log(
         `✓ concepts: ${c.nodes} nodes, ${c.links} links from ${c.files} files (${c.summarized} read, ${c.cached} cached)`,
       );

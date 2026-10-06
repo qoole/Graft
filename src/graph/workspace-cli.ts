@@ -65,8 +65,9 @@ export async function runWorkspaceBuild(root: string, opts: WorkspaceBuildOption
     if (Object.keys(childConfigPatch).length > 0) {
       patchBuildConfig(childDir, childConfigPatch);
     }
-    // Every progress line for this child carries its scope until the next.
-    progress.setScope(`[${index + 1}/${total}] ${childName}`);
+    // Each concurrent child owns a scope: its ticks feed the aggregate row,
+    // its transitions print prefixed lines, its ✓ drops it from the set.
+    const prog = progress.scope(`${index + 1}/${total} ${childName}`);
     const engine = new Graft({ ...opts.childConfig, contextDir: undefined });
     const startedAt = Date.now();
     // Deep children overlap their concept pass with the wiring graph, same as
@@ -76,9 +77,9 @@ export async function runWorkspaceBuild(root: string, opts: WorkspaceBuildOption
         engine.init(childDir, {
           extensions: opts.extensions,
           verbose: opts.verbose,
-          onProgress: ({ phase, index: i, total: t, file }) => {
-            progress.phase(phase);
-            progress.tick(i, t, file);
+          onProgress: ({ phase, index: i, total: t }) => {
+            prog.phase(phase);
+            prog.tick(i, t);
           },
         })
       : undefined;
@@ -86,9 +87,15 @@ export async function runWorkspaceBuild(root: string, opts: WorkspaceBuildOption
       llm: opts.deep,
       concurrency: opts.concurrency,
       contextSettled: concept,
+      onProgress: ({ phase, index: i, total: t }) => {
+        prog.phase(phase);
+        prog.tick(i, t);
+      },
     });
     if (concept) await concept;
     const secs = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    prog.done();
+    progress.flush(); // the ✓ line is stdout — never let it append to the row
     console.log(
       `✓ [${index + 1}/${total}] ${childName}/: ${g.nodes} nodes, ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}] · ${secs}s`,
     );
