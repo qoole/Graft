@@ -709,13 +709,14 @@ export function federateCallers(
 export async function splitWorkspace(
   root: string,
   override: string | undefined,
-  buildChild: (childDir: string, childName: string) => Promise<void>,
+  buildChild: (childDir: string, childName: string, index: number, total: number) => Promise<void>,
   onStart?: (info: { children: string[]; migrated: boolean }) => void,
 ): Promise<{ children: string[]; migrated: boolean }> {
   const children = discoverWorkspaceChildren(root).slice().sort();
   const migrated = hasMegaGraph(root, override);
   onStart?.({ children, migrated });
-  for (const child of children) await buildChild(join(root, child), child);
+  for (const [index, child] of children.entries())
+    await buildChild(join(root, child), child, index, children.length);
   clearParentGraft(root, override); // drop the mega-graph/.cache/cards…
   writeWorkspace(root, { version: 1, children }, override); // …leaving ONLY workspace.json
   return { children, migrated };

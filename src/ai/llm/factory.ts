@@ -19,6 +19,7 @@ import { OpenAIChatModel } from "./openai.js";
 import { AnthropicChatModel } from "./anthropic.js";
 import { LiteLLMChatModel } from "./litellm.js";
 import { OrcaRouterChatModel } from "./orcarouter.js";
+import { progress } from "../../util/progress.js";
 
 export type ProviderKind = "openai" | "anthropic" | "litellm" | "orcarouter";
 
@@ -32,33 +33,51 @@ export interface ChatModelConfig {
 }
 
 export function createChatModel(cfg: ChatModelConfig): ChatModel {
-  switch (cfg.provider) {
-    case "anthropic":
-      return new AnthropicChatModel({ apiKey: cfg.apiKey, model: cfg.model, baseUrl: cfg.baseUrl });
-    case "openai":
-      return new OpenAIChatModel({
-        apiKey: cfg.apiKey,
-        model: cfg.model,
-        baseUrl: cfg.baseUrl,
-        headers: cfg.headers,
-      });
-    case "litellm":
-      return new LiteLLMChatModel({
-        apiKey: cfg.apiKey,
-        model: cfg.model,
-        baseUrl: cfg.baseUrl,
-        headers: cfg.headers,
-      });
-    case "orcarouter":
-      return new OrcaRouterChatModel({
-        apiKey: cfg.apiKey,
-        model: cfg.model,
-        baseUrl: cfg.baseUrl,
-        headers: cfg.headers,
-      });
-    default: {
-      const _exhaustive: never = cfg.provider;
-      throw new Error(`unknown provider: ${String(_exhaustive)}`);
+  const inner: ChatModel = (() => {
+    switch (cfg.provider) {
+      case "anthropic":
+        return new AnthropicChatModel({ apiKey: cfg.apiKey, model: cfg.model, baseUrl: cfg.baseUrl });
+      case "openai":
+        return new OpenAIChatModel({
+          apiKey: cfg.apiKey,
+          model: cfg.model,
+          baseUrl: cfg.baseUrl,
+          headers: cfg.headers,
+        });
+      case "litellm":
+        return new LiteLLMChatModel({
+          apiKey: cfg.apiKey,
+          model: cfg.model,
+          baseUrl: cfg.baseUrl,
+          headers: cfg.headers,
+        });
+      case "orcarouter":
+        return new OrcaRouterChatModel({
+          apiKey: cfg.apiKey,
+          model: cfg.model,
+          baseUrl: cfg.baseUrl,
+          headers: cfg.headers,
+        });
+      default: {
+        const _exhaustive: never = cfg.provider;
+        throw new Error(`unknown provider: ${String(_exhaustive)}`);
+      }
     }
-  }
+  })();
+  // Every chat completion funnels through exactly one factory call, so this
+  // wrapper is the whole LLM-accounting surface: `progress.llmSummary()` reads
+  // the counters for the build's `llm:` output line. Retries live inside the
+  // transport, so one bracketed call = one logical request including them.
+  // Object.create keeps the inner model's prototype — `instanceof` for the
+  // concrete adapter classes must keep working (tests pin it).
+  const wrapped: ChatModel = Object.create(inner);
+  wrapped.create = async (req) => {
+    const t0 = progress.llmBegin();
+    try {
+      return await inner.create(req);
+    } finally {
+      progress.llmEnd(t0);
+    }
+  };
+  return wrapped;
 }

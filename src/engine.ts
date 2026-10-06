@@ -30,6 +30,8 @@ export interface InitOptions {
   extensions?: string[];
   /** Repo-relative directory prefixes to limit the concept pass (`--only-dir`). */
   onlyDirs?: string[];
+  /** Per-batch detail for cached synthesis batches (live batches always print). */
+  verbose?: boolean;
   /** Progress callback for long builds. */
   onProgress?: (info: BuildProgress) => void;
 }
@@ -68,6 +70,7 @@ export class Graft {
       model: this.modelLabel(),
       summarizer: this.summarizer(),
       synthesizer: this.synthesizer(),
+      verbose: opts.verbose,
       onProgress: opts.onProgress,
     });
   }

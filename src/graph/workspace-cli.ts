@@ -6,6 +6,7 @@
  * this file only renders them and wires the child builds through the engine.
  */
 import { Graft } from "../engine.js";
+import { progress } from "../util/progress.js";
 import { contextDirFor, ensureGitignored } from "../context/node-file.js";
 import { patchBuildConfig, type BuildConfig } from "../util/state.js";
 import type { EngineConfig } from "../ai/providers.js";
@@ -27,6 +28,8 @@ export interface WorkspaceBuildOptions {
   deep: boolean;
   extensions?: string[];
   concurrency?: number;
+  /** Per-batch detail for cached synthesis batches (live batches always print). */
+  verbose?: boolean;
   /** Provider/model/key config for child builds — WITHOUT any contextDir
    * override, so each child writes to its own `<child>/graft/`. */
   childConfig: EngineConfig;
@@ -46,7 +49,7 @@ export interface WorkspaceBuildOptions {
  * parent's `graft/` with `workspace.json`. Prints the one-time split warning
  * first when migrating away from a mega-graph. */
 export async function runWorkspaceBuild(root: string, opts: WorkspaceBuildOptions): Promise<void> {
-  const buildChild = async (childDir: string, childName: string): Promise<void> => {
+  const buildChild = async (childDir: string, childName: string, index: number, total: number): Promise<void> => {
     // Persisted BEFORE the child build itself runs, same as the single-repo
     // path in cli.ts, so this build and every later no-flag child build agree.
     const childConfigPatch: BuildConfig = {};
@@ -63,10 +66,23 @@ export async function runWorkspaceBuild(root: string, opts: WorkspaceBuildOption
       patchBuildConfig(childDir, childConfigPatch);
     }
     const engine = new Graft({ ...opts.childConfig, contextDir: undefined });
-    if (opts.deep) await engine.init(childDir, { extensions: opts.extensions });
+    const startedAt = Date.now();
+    if (opts.deep) {
+      await engine.init(childDir, {
+        extensions: opts.extensions,
+        verbose: opts.verbose,
+        onProgress: ({ phase, index: i, total: t, file }) => {
+          progress.phase(phase);
+          progress.tick(i, t, file);
+        },
+      });
+    }
     const g = await engine.graph(childDir, { llm: opts.deep, concurrency: opts.concurrency });
-    console.log(`✓ ${childName}/: ${g.nodes} nodes, ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}]`);
-    for (const e of g.errors) console.error(`✗ ${childName}/: ${e}`);
+    const secs = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    console.log(
+      `✓ [${index + 1}/${total}] ${childName}/: ${g.nodes} nodes, ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}] · ${secs}s`,
+    );
+    for (const e of g.errors) progress.note(`✗ ${childName}/: ${e}`);
   };
 
   const { children } = await splitWorkspace(
@@ -75,12 +91,20 @@ export async function runWorkspaceBuild(root: string, opts: WorkspaceBuildOption
     buildChild,
     ({ children, migrated }) => {
       if (migrated) console.error(migrationNote(children));
-      console.error(`building ${children.length} workspace repos: ${children.join(", ")}`);
+      console.error(
+        opts.verbose
+          ? `building ${children.length} workspace repos: ${children.join(", ")}`
+          : `building ${children.length} workspace repos (--verbose to list them)`,
+      );
     },
   );
   // Each child self-ignored during its own build; the parent's federation
   // index (graft/workspace.json) is written outside buildGraph, so ignore it here too.
   ensureGitignored(root, contextDirFor(root, opts.override));
+  const timing = progress.timing();
+  if (timing) console.log(timing);
+  const llm = progress.llmSummary();
+  if (llm) console.log(llm);
   console.log(`✓ workspace: ${children.length} repos federated → graft/workspace.json`);
   console.log(`  graft/ is git-ignored — each teammate runs \`graft build\` to regenerate it locally.`);
 }

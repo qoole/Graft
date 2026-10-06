@@ -9,6 +9,7 @@ import { Command } from "commander";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Graft } from "./engine.js";
+import { progress } from "./util/progress.js";
 import { resolveConfig, type EngineConfig } from "./ai/providers.js";
 import type { ProviderKind } from "./ai/llm/factory.js";
 import { formatCheckReport } from "./context/check.js";
@@ -368,6 +369,8 @@ program
   .option("--no-reuse", "re-parse every file instead of replaying unchanged ones from the extraction cache")
   .option("--lsp", "add compiler-grade call edges via a language server if one is installed (opt-in, slower; e.g. rust-analyzer, clangd)")
   .option("--allow-partial", "with --deep: exit 0 even when some files' summaries failed (default: a degraded meaning tier exits 1)")
+  .option("--verbose", "progress detail: full paths, cached synthesis batches, heartbeat every file")
+  .option("--quiet", "results and errors only — no progress, no phase lines")
   .option(
     "--follow-submodules",
     "include initialized Git submodules recursively; persisted for later builds and automatic refreshes",
@@ -411,6 +414,8 @@ program
       reuse?: boolean;
       lsp?: boolean;
       allowPartial?: boolean;
+      verbose?: boolean;
+      quiet?: boolean;
       includeDir?: string[];
       onlyDir?: string[];
       followSubmodules?: boolean;
@@ -503,6 +508,13 @@ program
       );
     }
 
+    // All build chatter goes through the progress renderer: a TTY gets one
+    // self-overwriting row, a pipe gets heartbeats, errors always win the row.
+    // Configured before the workspace branch so child builds inherit it.
+    const quiet = opts.quiet === true;
+    const verbose = opts.verbose === true;
+    progress.configure({ quiet, verbose });
+
     // Workspace parent: build each child into its OWN graft/ + a workspace index.
     const buildRoot = resolve(dir);
     const buildGlobalDir = program.opts<GlobalOpts>().dir;
@@ -511,6 +523,7 @@ program
         deep: !!deep,
         extensions: opts.extensions,
         concurrency,
+        verbose,
         childConfig: cliConfig(),
         override: buildGlobalDir,
         includeDirs: opts.includeDir,
@@ -527,20 +540,24 @@ program
       const c = await engine.init(dir, {
         extensions: opts.extensions,
         onlyDirs,
-        onProgress: ({ phase, index, total, file }) =>
-          process.stderr.write(
-            `\r${phase === "summarize" ? "reading" : "writing"} concepts ${index + 1}/${total}: ${file.slice(0, 40).padEnd(40)}`,
-          ),
+        verbose,
+        onProgress: ({ phase, index, total, file }) => {
+          progress.phase(phase);
+          progress.tick(index, total, file);
+        },
       }).catch((err: unknown) => {
         // Only the stage and a code enum; the message stays on this machine.
         track("build_failed", { stage: "summarize", code: errorCode(err) }, { repo: buildRoot });
         throw err;
       });
-      process.stderr.write("\n");
+      progress.flush();
       console.log(
         `✓ concepts: ${c.nodes} nodes, ${c.links} links from ${c.files} files (${c.summarized} read, ${c.cached} cached)`,
       );
-      for (const e of c.errors) console.error(`✗ ${e}`);
+      if (c.batches > 0) {
+        console.log(`  synthesis: ${c.batches} batches (${c.synthCached} cached, ${c.batches - c.synthCached} live)`);
+      }
+      for (const e of c.errors) progress.note(`✗ ${e}`);
       conceptErrors = c.errors;
       conceptFatal = c.fatal;
     }
@@ -552,15 +569,15 @@ program
       reuse: opts.reuse,
       lsp: opts.lsp,
       onlyDirs,
-      onProgress: ({ phase, index, total, file }) =>
-        process.stderr.write(
-          `\r${phase === "enrich" ? "summarizing" : "parsing"} ${index + 1}/${total}: ${file.slice(0, 50).padEnd(50)}`,
-        ),
+      onProgress: ({ phase, index, total, file }) => {
+        progress.phase(phase);
+        progress.tick(index, total, file);
+      },
     }).catch((err: unknown) => {
       track("build_failed", { stage: "graph", code: errorCode(err) }, { repo: buildRoot });
       throw err;
     });
-    process.stderr.write("\n");
+    progress.flush();
     console.log(`✓ wiring: ${g.nodes} nodes (${fmt(g.byKind)}), ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}]`);
     console.log(`  parsed: ${g.parsed} of ${g.files} files (${g.reused} replayed from cache)`);
     // Worth one line: this build started from a graph the user never built *here*.
@@ -569,6 +586,10 @@ program
       const m = g.meaning;
       console.log(`  meaning: ${m.computed} computed, ${m.cached} cached, ${m.stale} stale, ${m.pending} pending`);
     }
+    const timingLine = progress.timing();
+    if (timingLine) console.log(timingLine);
+    const llmLine = progress.llmSummary();
+    if (llmLine) console.log(llmLine);
     console.log(`  → ${g.contextDir}`);
     // The activation event. Everything here is a bucket or a fixed label: repo
     // scale rather than a file count, a language set rather than file names.
@@ -583,7 +604,7 @@ program
       },
       { repo: buildRoot },
     );
-    for (const e of g.errors) console.error(`✗ ${e}`);
+    for (const e of g.errors) progress.note(`✗ ${e}`);
 
     const rel = relative(process.cwd(), g.contextDir) || "graft";
     if (process.env.GRAFT_NO_GITIGNORE) {

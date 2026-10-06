@@ -23,6 +23,7 @@ import { readFollowNestedRepos, readFollowSubmodules, readIncludeDirs } from "..
 import type { Summarizer } from "../ai/summarize.js";
 import { LlmFailureGate } from "../ai/failure.js";
 import type { FileSummary, SynthNode, Synthesizer } from "../ai/synthesize.js";
+import { progress } from "../util/progress.js";
 import {
   CACHE_DIR,
   MANIFEST_VERSION,
@@ -72,6 +73,8 @@ export interface BuildOptions {
   synthesizer: Synthesizer;
   /** Files summarized in parallel during phase 1. Default 8. Raised via `graft build -j`. */
   concurrency?: number;
+  /** Per-batch detail for cached synthesis batches (live batches always print). */
+  verbose?: boolean;
   onProgress?: (info: BuildProgress) => void;
 }
 
@@ -81,6 +84,8 @@ export interface BuildResult {
   summarized: number;
   cached: number;
   batches: number;
+  /** Batches served from the synthesis cache — reported next to `batches`. */
+  synthCached: number;
   nodes: number;
   links: number;
   errors: string[];
@@ -176,6 +181,7 @@ export async function buildContext(dir: string, opts: BuildOptions): Promise<Bui
     links: 0,
     errors: [],
     failedFiles: 0,
+    synthCached: 0,
     skippedFiles: 0,
   };
 
@@ -245,6 +251,7 @@ export async function buildContext(dir: string, opts: BuildOptions): Promise<Bui
   result.batches = batches.length;
 
   const synthNodes: SynthNode[] = [];
+  let synthCached = 0;
   for (let b = 0; b < batches.length; b++) {
     opts.onProgress?.({ phase: "synthesize", index: b, total: batches.length, file: `batch ${b + 1}` });
     const key = batchKey(batches[b], hashByPath);
@@ -256,13 +263,24 @@ export async function buildContext(dir: string, opts: BuildOptions): Promise<Bui
       nodes = await opts.synthesizer.synthesize(batches[b]);
       if (nodes.length > 0) cache.synth[key] = nodes;
       else delete cache.synth[key];
+    } else {
+      synthCached++;
     }
     const links = nodes.reduce((n, node) => n + node.links.length, 0);
-    console.error(
-      `  synthesis batch ${b + 1}/${batches.length}: ${nodes.length} nodes, ${links} links${cached ? " (cached)" : ""}`,
-    );
+    // Live batches are slow and interesting — always a line. Cached batches
+    // were the old output's noise floor (hundreds of lines in the first two
+    // seconds); they surface only under --verbose, and the count lands in the
+    // synthesis summary either way.
+    if (cached && !opts.verbose) {
+      // counted only; the summary line in the ✓ block reports it
+    } else {
+      progress.note(
+        `  synthesis batch ${b + 1}/${batches.length}: ${nodes.length} nodes, ${links} links${cached ? " (cached)" : ""}`,
+      );
+    }
     synthNodes.push(...nodes);
   }
+  result.synthCached = synthCached;
   // Drop cache entries for batches we no longer produce, so it can't grow forever.
   // Skip empty arrays so a failed batch is retried on the next --deep, not frozen.
   cache.synth = Object.fromEntries(
