@@ -22,6 +22,18 @@
  * with no chance of a result. */
 export const MAX_CONSECUTIVE_FAILURES = 5;
 
+/** Consecutive TRANSPORT-TIMEOUT failures that end a pass. A timeout is the
+ * retryable class — the SDK ladder already spent minutes on it — and at high
+ * `-j` the slowest files cluster at the pass's tail, so 5 consecutive timeouts
+ * happen by arithmetic whenever a repo contains a few files a model chokes on.
+ * They get a wider backstop (still finite: a fully hung endpoint must stop). */
+export const MAX_CONSECUTIVE_TIMEOUTS = 25;
+
+/** Transport-timeout signature — the retryable failure class. */
+function timeoutFailure(message: string): boolean {
+  return /timed out|timeout|etimedout|socket hang up/i.test(message);
+}
+
 /**
  * Errors no amount of retrying fixes: the key is wrong, or the account/quota is
  * spent. Matched on the message because that is all a provider-neutral transport
@@ -74,7 +86,11 @@ export class LlmFailureGate {
     }
     if (opts?.quality) return;
     this.consecutive++;
-    if (this.consecutive >= MAX_CONSECUTIVE_FAILURES) {
+    // Timeouts are the retryable class: the same five slow files can be a
+    // permanent repo property (big file, slow model) rather than a provider
+    // outage, so they get the wider backstop before the pass declares fatal.
+    const cutoff = timeoutFailure(message) ? MAX_CONSECUTIVE_TIMEOUTS : MAX_CONSECUTIVE_FAILURES;
+    if (this.consecutive >= cutoff) {
       this.fatal = `${this.consecutive} files in a row failed, so the pass stopped rather than keep calling. Last error: ${message}`;
     }
   }

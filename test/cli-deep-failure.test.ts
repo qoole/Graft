@@ -15,6 +15,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpRepo } from "./helpers.js";
+import { LlmFailureGate } from "../src/ai/failure.js";
 
 /** A gateway that answers every request the way an exhausted quota does. */
 async function quotaExhaustedServer(): Promise<{ url: string; close: () => Promise<void>; calls: () => number }> {
@@ -128,4 +129,18 @@ test("#127: the doomed calls stop instead of one per file", async () => {
   } finally {
     await gateway.close();
   }
+});
+
+test("gate: transport timeouts get the wide backstop, hard failures don't", () => {
+  const slow = new LlmFailureGate();
+  for (let i = 0; i < 24; i++) slow.record("Request timed out.");
+  assert.equal(slow.stopped, false, "timeout-class failures must not trip the 5-cut");
+  slow.record("Request timed out.");
+  assert.equal(slow.stopped, true, "25 consecutive timeouts = the endpoint is fully hung");
+
+  const hard = new LlmFailureGate();
+  for (let i = 0; i < 5; i++) hard.record("Request timed out.");
+  assert.equal(hard.stopped, false, "5 timeout files at the tail of a -j50 pass = slow files, not an outage");
+  hard.record("invalid api key");
+  assert.equal(hard.stopped, true, "auth stays immediately terminal");
 });
