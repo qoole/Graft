@@ -26,6 +26,8 @@
  */
 
 const REDRAW_MS = 250;
+const PULSE_MS = 1000;
+const THROBBER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const HEARTBEAT_MS = 30_000;
 
 let quiet = false;
@@ -37,6 +39,8 @@ let startedAt = 0;
 let lastHeartbeatMs = 0;
 let lastDrawMs = 0;
 let lastFile = ""; // single-repo: last tick's file, shown on the row
+let frameIdx = 0;
+let pulse: ReturnType<typeof setInterval> | undefined;
 
 // Cumulative done-counters per activity — the row's core. Only climb.
 const cumulative: Record<string, number> = {};
@@ -142,7 +146,7 @@ function draw(force = false): void {
   if (!force && now - lastDrawMs < REDRAW_MS) return;
   lastDrawMs = now;
   const label = scopes.size === 1 && scopes.has("\0single") && lastFile ? `: ${lastFile.slice(0, 48)}` : "";
-  write(`\r\x1b[K${rowText()}${label}`);
+  write(`\r\x1b[K${THROBBER[frameIdx]} ${rowText()}${label}`);
   dirty = true;
 }
 
@@ -203,11 +207,35 @@ function makeScope(label: string): ProgressScope {
   };
 }
 
+/**
+ * Proof-of-life: repaint the row (and advance the throbber) every second
+ * whether or not any ticks arrive — slow in-flight calls mean no completions
+ * for minutes, and a frozen "oldest <1s" is exactly the lie this module
+ * exists to stop. Non-TTY: the heartbeat runs off the pulse too, so a run
+ * whose calls all take minutes still logs a line every HEARTBEAT_MS.
+ */
+function startPulse(): void {
+  if (pulse) return;
+  pulse = setInterval(() => {
+    if (quiet) return;
+    frameIdx = (frameIdx + 1) % THROBBER.length;
+    const now = Date.now();
+    if (tty) {
+      if (dirty) draw(true);
+    } else if (now - lastHeartbeatMs >= HEARTBEAT_MS) {
+      lastHeartbeatMs = now;
+      fullLine(heartbeatLine());
+    }
+  }, PULSE_MS);
+  pulse.unref?.();
+}
+
 export const progress = {
   configure(opts: { quiet?: boolean; verbose?: boolean }): void {
     quiet = opts.quiet === true;
     verbose = opts.verbose === true;
     startedAt = Date.now();
+    startPulse();
   },
 
   /** A concurrent unit (workspace child). */
