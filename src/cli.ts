@@ -536,6 +536,7 @@ program
         concurrency,
         verbose,
         synthConcurrency,
+        allowPartial: opts.allowPartial,
         childConfig: cliConfig(),
         override: buildGlobalDir,
         includeDirs: opts.includeDir,

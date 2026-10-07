@@ -32,6 +32,10 @@ export interface WorkspaceBuildOptions {
   verbose?: boolean;
   /** Max concept synthesis batches in flight per child (default 4). */
   synthConcurrency?: number;
+  /** Accept a degraded meaning tier in some children without failing the
+   * whole workspace build (single-repo: `--allow-partial`). Default: any
+   * child whose concept pass stopped early sets exit code 1. */
+  allowPartial?: boolean;
   /** Provider/model/key config for child builds — WITHOUT any contextDir
    * override, so each child writes to its own `<child>/graft/`. */
   childConfig: EngineConfig;
@@ -95,15 +99,37 @@ export async function runWorkspaceBuild(root: string, opts: WorkspaceBuildOption
         prog.tick(i, t);
       },
     });
-    if (concept) await concept;
+    let degraded: string | undefined;
+    const conceptErrors: string[] = [];
+    if (concept) {
+      const c = await concept;
+      if (c.fatal) degraded = c.fatal;
+      conceptErrors.push(...c.errors);
+    }
     const secs = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
     prog.done();
     progress.flush(); // the ✓ line is stdout — never let it append to the row
     console.log(
       `✓ [${index + 1}/${total}] ${childName}/: ${g.nodes} nodes, ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}] · ${secs}s`,
     );
-    for (const e of g.errors) progress.note(`✗ ${childName}/: ${e}`);
+    // Per-file failures grouped by message: fifty identical 403s are one
+    // fact, not fifty lines. Full list under --verbose.
+    const groups = new Map<string, number>();
+    const all = [...conceptErrors, ...g.errors];
+    for (const e of all) {
+      const kind = e.includes(": ") ? e.slice(e.indexOf(": ") + 2) : e;
+      groups.set(kind, (groups.get(kind) ?? 0) + 1);
+    }
+    if (opts.verbose) for (const e of all) progress.note(`✗ ${childName}/: ${e}`);
+    else
+      for (const [kind, n] of groups)
+        progress.note(n > 1 ? `✗ ${childName}/: ${n} files — ${kind}` : `✗ ${childName}/: ${kind}`);
+    if (degraded) {
+      if (!opts.allowPartial) degradedChildren++;
+      progress.note(`⚠ [${index + 1}/${total}] ${childName}/: meaning tier incomplete — ${degraded}`);
+    }
   };
+  let degradedChildren = 0;
 
   const { children } = await splitWorkspace(
     root,
@@ -127,6 +153,12 @@ export async function runWorkspaceBuild(root: string, opts: WorkspaceBuildOption
   if (llm) console.log(llm);
   console.log(`✓ workspace: ${children.length} repos federated → graft/workspace.json`);
   console.log(`  graft/ is git-ignored — each teammate runs \`graft build\` to regenerate it locally.`);
+  if (degradedChildren > 0 && !opts.allowPartial) {
+    console.error(
+      `✗ ${degradedChildren} repo(s) have an incomplete meaning tier — re-run \`graft build --deep\` to resume from what is cached, or pass --allow-partial.`,
+    );
+    process.exitCode = 1;
+  }
 }
 
 export function runWorkspaceAsk(
