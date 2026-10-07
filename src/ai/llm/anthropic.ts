@@ -21,6 +21,8 @@ import type { ChatModel, ChatRequest, ChatResponse, Message, ToolCall, ToolSpec,
 const PROVIDER = "anthropic";
 const JSON_TOOL = "emit_json";
 const DEFAULT_MAX_TOKENS = 4096;
+/** Ceiling for the truncation retry (mirrors the openai adapter). */
+const LENGTH_RETRY_CAP = 32768;
 
 export interface AnthropicChatModelOptions {
   apiKey: string;
@@ -105,7 +107,26 @@ export class AnthropicChatModel implements ChatModel {
       params.tools = tools;
     }
 
-    const resp = await this.client.messages.create(params, { timeout: req.timeoutMs ?? transportTimeoutMs() });
+    // A stop_reason "max_tokens" reply is a real answer to the wrong question:
+    // double the output budget once and ask again, mirroring the openai
+    // adapter's truncation retry (reasoning burn + long tool args overflow
+    // budgets sized for plain models).
+    let attemptParams = params;
+    for (let i = 0; i < 2; i++) {
+      const resp = await this.client.messages.create(attemptParams, {
+        timeout: req.timeoutMs ?? transportTimeoutMs(),
+      });
+      if (resp.stop_reason !== "max_tokens" || attemptParams.max_tokens >= LENGTH_RETRY_CAP) {
+        return this.fromResponse(resp, fmt.kind);
+      }
+      attemptParams = {
+        ...attemptParams,
+        max_tokens: Math.min(LENGTH_RETRY_CAP, attemptParams.max_tokens * 2),
+      };
+    }
+    const resp = await this.client.messages.create(attemptParams, {
+      timeout: req.timeoutMs ?? transportTimeoutMs(),
+    });
     return this.fromResponse(resp, fmt.kind);
   }
 

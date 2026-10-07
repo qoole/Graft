@@ -30,6 +30,11 @@ export interface OpenAIChatModelOptions {
 }
 
 type ChatParams = OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
+
+/** Ceiling for the truncation retry: above this, a reply that still does not
+ * fit is a prompt too big for the model's output window, and doubling again
+ * just bills for the same failure. */
+const LENGTH_RETRY_CAP = 32768;
 type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
 /** A text content part, optionally carrying a cache breakpoint (OpenRouter passthrough). */
@@ -197,7 +202,20 @@ export class OpenAIChatModel implements ChatModel {
     // Bounded: one retry per known incompatibility below, never an open loop.
     for (let i = 0; i < 4; i++) {
       try {
-        return await this.client.chat.completions.create(attempt, { timeout: timeoutMs ?? transportTimeoutMs() });
+        const resp = await this.client.chat.completions.create(attempt, { timeout: timeoutMs ?? transportTimeoutMs() });
+        // A truncated reply is a real answer to the wrong question: double the
+        // output budget and ask again, instead of failing a file that the next
+        // `graft build --deep` would just re-run with the same cap. Reasoning
+        // models burn output tokens thinking before the payload — the budget a
+        // plain model needs is a fraction of what they do.
+        if (resp.choices?.[0]?.finish_reason === "length" && (attempt.max_tokens ?? 0) < LENGTH_RETRY_CAP) {
+          attempt = {
+            ...attempt,
+            max_tokens: Math.min(LENGTH_RETRY_CAP, Math.max(4096, (attempt.max_tokens ?? 4096) * 2)),
+          } as ChatParams;
+          continue;
+        }
+        return resp;
       } catch (err) {
         // Checked before the tool_choice fallback below: a reasoning refusal
         // also names tool_choice, and turning reasoning off keeps the caller's

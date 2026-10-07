@@ -278,3 +278,46 @@ test("anthropic: json mode forces emit_json and returns serialized text", async 
   assert.equal(res.text, '{"correct":true}');
   assert.equal(res.toolCalls.length, 0);
 });
+
+test("openai: a length-truncated reply retries once with a doubled max_tokens", async () => {
+  const calls: any[] = [];
+  const mk = (content: string, finish: string) =>
+    openAiResp({ choices: [{ message: { content }, finish_reason: finish }] });
+  const client = {
+    chat: {
+      completions: {
+        create: async (params: any) => {
+          calls.push(params);
+          return calls.length === 1 ? mk("half a summary", "length") : mk("full summary", "stop");
+        },
+      },
+    },
+  } as unknown as OpenAI;
+  const m = new OpenAIChatModel({ apiKey: "x", model: "local-model", client });
+  const res = await m.create({ messages: [{ role: "user", content: "grade" }], maxTokens: 4096 });
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].max_tokens, 4096);
+  assert.equal(calls[1].max_tokens, 8192, "truncation doubles the budget once, not forever");
+  assert.equal(res.text, "full summary");
+});
+
+test("openai: a reply that still truncates at the cap is surfaced, not looped", async () => {
+  const calls: any[] = [];
+  const client = {
+    chat: {
+      completions: {
+        create: async (params: any) => {
+          calls.push(params);
+          return openAiResp({ choices: [{ message: { content: "partial" }, finish_reason: "length" }] });
+        },
+      },
+    },
+  } as unknown as OpenAI;
+  const m = new OpenAIChatModel({ apiKey: "x", model: "local-model", client });
+  const res = await m.create({ messages: [{ role: "user", content: "grade" }], maxTokens: 16384 });
+
+  assert.equal(calls.length, 2, "16384 -> 32768, then the still-truncated reply surfaces");
+  assert.equal(calls[1].max_tokens, 32768);
+  assert.equal(res.stopReason, "length");
+});
