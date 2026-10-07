@@ -182,7 +182,7 @@ export class ChatCruxSummarizer implements CruxSummarizer {
     if (input.nodes.length === 0) return [];
     const res = await this.model.create({
       temperature: 0,
-      maxTokens: 8192,
+      maxTokens: 16384, // truncated at 8192: reasoning burn + long tool args (finish_reason=length)
       tools: [
         {
           name: RECORD_TOOL,

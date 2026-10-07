@@ -40,7 +40,7 @@ export class ChatSummarizer implements Summarizer {
   async summarize(code: string, opts: { path: string }): Promise<string> {
     const res = await this.model.create({
       temperature: 0,
-      maxTokens: 2048,
+      maxTokens: 4096, // reasoning models spend output tokens thinking; 2048 truncated
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: userContent(code, opts.path) },

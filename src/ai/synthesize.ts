@@ -140,7 +140,7 @@ export class ChatSynthesizer implements Synthesizer {
     if (files.length === 0) return [];
     const res = await this.model.create({
       temperature: 0,
-      maxTokens: 8192,
+      maxTokens: 16384, // headroom for reasoning burn on full char-budget batches
       // One batch carries a whole char-budget of summaries; a reasoning model
       // legitimately spends several minutes on it — well past the per-file
       // timeout. GRAFT_SYNTH_TIMEOUT (seconds), default 600.

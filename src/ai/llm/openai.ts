@@ -10,7 +10,7 @@
  * input count so {@link Usage.input} is uncached-only.
  */
 import OpenAI from "openai";
-import { transportRetries, transportTimeoutMs } from "./types.js";
+import { llmUndici, transportRetries, transportTimeoutMs } from "./types.js";
 import type { ChatModel, ChatRequest, ChatResponse, Message, ToolCall, ToolSpec, Usage } from "./types.js";
 
 const PROVIDER = "openai";
@@ -146,6 +146,12 @@ export class OpenAIChatModel implements ChatModel {
         defaultHeaders: opts.headers,
         maxRetries: transportRetries(),
         timeout: transportTimeoutMs(),
+        // The dispatcher and the fetch MUST come from the same undici copy:
+        // an Agent from openai's bundled undici handed to Node's built-in
+        // fetch is a foreign dispatcher and every request dies as
+        // "Connection error."
+        fetch: llmUndici().fetch as never,
+        fetchOptions: { dispatcher: llmUndici().dispatcher as never },
       });
   }
 

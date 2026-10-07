@@ -15,7 +15,7 @@
  *     signatures survive a multi-turn loop.
  */
 import Anthropic from "@anthropic-ai/sdk";
-import { transportRetries, transportTimeoutMs } from "./types.js";
+import { llmUndici, transportRetries, transportTimeoutMs } from "./types.js";
 import type { ChatModel, ChatRequest, ChatResponse, Message, ToolCall, ToolSpec, Usage } from "./types.js";
 
 const PROVIDER = "anthropic";
@@ -44,7 +44,14 @@ export class AnthropicChatModel implements ChatModel {
     this.label = opts.label ?? `${PROVIDER}:${opts.model}`;
     this.client =
       opts.client ??
-      new Anthropic({ apiKey: opts.apiKey, baseURL: opts.baseUrl, maxRetries: transportRetries(), timeout: transportTimeoutMs() });
+      new Anthropic({
+        apiKey: opts.apiKey,
+        baseURL: opts.baseUrl,
+        maxRetries: transportRetries(),
+        timeout: transportTimeoutMs(),
+        fetch: llmUndici().fetch as never,
+        fetchOptions: { dispatcher: llmUndici().dispatcher as never },
+      });
   }
 
   async create(req: ChatRequest): Promise<ChatResponse> {

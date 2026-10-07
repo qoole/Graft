@@ -82,6 +82,8 @@ export interface Usage {
   cacheCreate: number;
 }
 
+import { createRequire } from "node:module";
+
 export interface ChatRequest {
   messages: Message[];
   tools?: ToolSpec[];
@@ -141,3 +143,26 @@ export function transportTimeoutMs(): number {
   const raw = Number(process.env.GRAFT_LLM_TIMEOUT);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) * 1000 : 300_000;
 }
+
+/**
+ * undici dispatcher with the head/body timeouts DISABLED: the SDK's own
+ * `timeout` (transportTimeoutMs / per-request timeoutMs) must be the single
+ * canceller. undici's default headersTimeout is 5 minutes, which silently
+ * truncated our longer budgets — the SDK timer believed it had minutes left
+ * while the dispatcher had already killed the socket ("configure a matching
+ * undici fetch ... headersTimeout" is the SDK saying exactly this).
+ */
+let undici: { fetch: unknown; dispatcher: unknown } | undefined;
+/** The undici fetch + a no-head-timeout Agent, from ONE undici copy. Cast at
+ * the call site: openai bundles its own undici-types, so the real instances
+ * and the expected types are different declarations of the same shape — and
+ * mixing copies (Agent from one, fetch from Node's built-in) makes every
+ * request die as "Connection error." */
+export function llmUndici(): { fetch: unknown; dispatcher: unknown } {
+  if (!undici) {
+    const u = createRequire(import.meta.url)("undici") as typeof import("undici");
+    undici = { fetch: u.fetch, dispatcher: new u.Agent({ headersTimeout: 0, bodyTimeout: 0 }) };
+  }
+  return undici;
+}
+
