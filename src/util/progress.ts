@@ -41,6 +41,7 @@ let lastDrawMs = 0;
 let lastFile = ""; // single-repo: last tick's file, shown on the row
 let frameIdx = 0;
 let pulse: ReturnType<typeof setInterval> | undefined;
+let rowActive = false; // a row belongs on screen — notes displace it, the pulse restores it
 
 // Cumulative done-counters per activity — the row's core. Only climb.
 const cumulative: Record<string, number> = {};
@@ -148,6 +149,7 @@ function draw(force = false): void {
   const label = scopes.size === 1 && scopes.has("\0single") && lastFile ? `: ${lastFile.slice(0, 48)}` : "";
   write(`\r\x1b[K${THROBBER[frameIdx]} ${rowText()}${label}`);
   dirty = true;
+  rowActive = true;
 }
 
 function recordTick(scopeKey: string, phase: string, index: number): void {
@@ -221,7 +223,9 @@ function startPulse(): void {
     frameIdx = (frameIdx + 1) % THROBBER.length;
     const now = Date.now();
     if (tty) {
-      if (dirty) draw(true);
+      // Restore the row after notes displaced it — do not wait for a tick:
+      // at slow-call pace the next tick can be minutes away.
+      if (rowActive) draw(true);
     } else if (now - lastHeartbeatMs >= HEARTBEAT_MS) {
       lastHeartbeatMs = now;
       fullLine(heartbeatLine());
