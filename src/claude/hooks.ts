@@ -516,7 +516,13 @@ export async function main(event: string): Promise<void> {
     // pulls spans itself via `graft ask --source` when a pointer looks right.
     // relevantRetrieval then drops the pack entirely when the prompt barely
     // overlaps the top hit or when every hit was already injected this session.
-    const askArgs = withContextDirArg(dir, ['ask', prompt, '.', '--json', '-n', '3']);
+    // A workspace parent (`graft/workspace.json`) federates `ask` across every
+    // child repo. At workspace scale that is minutes of CPU — far past any hook
+    // budget — and the over-budget child is dropped at `if (!ask) return` with
+    // nothing to show for it. Skip retrieval here: the cheap nudge hook and the
+    // graft MCP tools remain the retrieval path for workspace sessions.
+    if (existsSync(join(dir, 'graft', 'workspace.json'))) return;
+    const askArgs = withContextDirArg(dir, ['ask', prompt, '.', '--json', '-n', '3', '--no-refresh']);
     // "You're working in backend/, weight it": only fires on a multi-scope
     // repo whose lastFile resolves cleanly to one scope — see lastFileScopeHint.
     const scopeHint = lastFileScopeHint(dir, readStats(dir)?.lastFile);
