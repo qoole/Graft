@@ -5,6 +5,12 @@ to a command run on 2026-10-10; the benchmark tree lives in `/build/eg2-bench/`
 (artifact map in Appendix A). Graft-internals citations are against `graft_src`
 at `@nanonets/graft` 0.9.0 and were spot-checked while writing.
 
+**§1-§9 are as of 2026-10-10 and unchanged except two in-place corrections
+flagged `[RESOLVED]` / `partially answered` (§5.5 first bullet, §9 item 1).
+§10 was added 2026-10-11 and reports the fused-ranking A/B; §3's `src/ask/`
+line numbers are still cited against 0.9.0 and have **not** been re-pinned
+against the §10 implementation worktree — re-pin before merge.**
+
 ## 0. TL;DR
 
 Add a **node-embedding sidecar** (`graft/.cache/embeddings.json` + packed
@@ -26,6 +32,18 @@ pipeline further (§5.4.2). The one cross-box quality failure — OpenVINO's
 ONNX importer computing a wrong embedding space at *every* precision — was
 root-caused and bypassed, not by swapping devices but by skipping the ONNX
 importer entirely (§5.4).
+
+**Addendum 2026-10-11 (§10): the fusion has now been built and measured.** A
+flag-gated linear blend (`VEC_WEIGHT`, sidecar read inside the opt-in guard,
+byte-identical output with the flag off) passes 240 oracle queries on small_rs
++ small_ts at every weight swept. Measured best `VEC_WEIGHT = 1.5`: pooled
+file hit@5 0.912 → 0.933, node hit@5 0.896 → 0.925, node MRR@10 0.815 → 0.844,
+at a cost of +2-12 ms median latency (noisy; see §10.5). The measured effect
+is small, concentrated in one of two corpora, and mostly *reorders* files the
+lexical ranker had already retrieved rather than finding new ones. §10 does
+**not** clear the channel for default-on shipping: it recommends an opt-in
+`--vector` flag, off by default, on ts-like corpora only, and states the four
+confounds that would have to be re-run before anyone turns it on by default.
 
 ## 1. Problem: what indexing and retrieval cost today
 
@@ -396,10 +414,14 @@ q_nl recall@1 by +27.5 points over the int8 pipeline.
 
 ### 5.5 What was not measured
 
-- End-to-end fused ranking (graft ask + vector term) was never run; §5.3
-  measures pure vector retrieval, and the 12-query graft baseline in §1.2 is
-  baseline-only. The draft's earlier "vectors beat graft's rank" TL;DR claim
-  is withdrawn as untested.
+- **[RESOLVED 2026-10-11 — see §10; corrected in place.]** This bullet said
+  end-to-end fused ranking had never been run. It has now: a flag-gated linear
+  blend, `VEC_WEIGHT` swept over 7 settings, 240 queries across small_rs +
+  small_ts. §10 reports the result, including that the pre-registered gate
+  could not be met on the baseline that was measured. §5.3 still measures pure
+  vector retrieval only, and the 12-query baseline in §1.2 is still
+  baseline-only; the draft's original "vectors beat graft's rank" TL;DR claim
+  remains withdrawn as untested on its own terms.
 - int8-vs-fp32 full-eval quality delta at 768d: **partially resolved** —
   §5.4.2 measured it on small_rs (fp16 wins q_nl recall@1 by +27.5 points);
   small_ts and the other repos still unmeasured on exact vectors.
@@ -495,8 +517,15 @@ Standalone sidecar first; no committed-data changes at any step.
 
 ## 9. Open questions
 
-1. `VEC_WEIGHT` and RRF-vs-linear: unmeasured until the fused ranking exists
-   (§5.5). Needs the golden-set harness ported into graft's test suite
+1. `VEC_WEIGHT` and RRF-vs-linear: **partially answered (§10).** The linear
+   blend is built and swept; `VEC_WEIGHT = 1.5` is the measured best on the
+   benchmark, but the curve is flat from 0.30 to 1.5 and the measured effect
+   is small enough that §10 recommends shipping it opt-in rather than tuned.
+   **Still open: RRF-vs-linear.** The RRF variant named in §2.4 was not built
+   or run — Stage 1 was declared saturated against the oracle-union ceiling
+   (0.933), which made the later protocol stages moot on *this* baseline. If
+   that baseline is ever re-run on a weaker arm A, RRF becomes live again.
+   Still outstanding: the golden-set harness ported into graft's test suite
    (`test/ask.test.ts` pattern).
 2. Asymmetric query prompt (`task: code retrieval | query:`) — expected few
    points up; measure after the chunk fix.
@@ -519,6 +548,308 @@ Standalone sidecar first; no committed-data changes at any step.
 9. Eval breadth: cross-repo tasks, issue-body queries, and a non-circular NL
    form (§5.3 notes the nl column's construction bias).
 
+## 10. Addendum: the fused-ranking A/B, measured 2026-10-11
+
+This section is new as of 2026-10-11 and does not rewrite §1-§9. It reports the
+first end-to-end measurement of the §2.4 fusion inside `graft ask`, corrects one
+claim in §5.5 in place (that bullet now carries a `[RESOLVED]` marker), and
+gives a go/no-go.
+
+Everything below was re-derived from the raw per-query dump while writing this
+section, not taken from the run's own summary. Commands are given with each
+claim; artifacts are in Appendix A.
+
+### 10.0 What was built and what it guarantees
+
+The prototype implements §2.4's linear blend exactly as written — no RRF, no
+form-conditional weights, no schema change:
+
+- `src/ask/vector-index.ts` (new) — sidecar reader. Returns `null` on missing,
+  unparseable, unknown-version, dim-mismatch, model-mismatch, truncated-bin or
+  duplicate-id, mirroring the `readAskIndex` null-contract of §2.5.
+- `src/ask/ask.ts` — `AskOptions` gains `vectorWeight` / `queryVector` /
+  `queryModel`. The sidecar is read **inside the opt-in guard**, so the
+  no-flag path never touches the file. The blend is one additive term at
+  `ask.ts:768`: `lexN + GRAPH_WEIGHT * pr + vecWeight * vecN`, with `vecN`
+  max-normalised over the candidate set. `VECTOR_WEIGHT_CEILING = 1.5`.
+- `src/ask/fuse.ts` — same term on the multi-scope path, via a defaulted
+  `vectorWeight = 0` parameter so existing callers are byte-identical.
+- `src/cli.ts` — `--vector <weight[@path]>`, threaded through **both** the
+  workspace-federation branch (which returns early and would otherwise drop
+  it) and `engine.ask`.
+- `src/engine.ts` — `Graft.ask` retyped from a hand-written inline option
+  literal to `Omit<AskOptions, 'contextDir'>` + spread.
+
+Two of those are worth calling out because they are properties, not features.
+The opt-in guard placement is what makes the byte-identity claim in §2.5 hold
+mechanically rather than by convention. And the `engine.ts` retype fixed a
+pre-existing bug: the old inline literal silently dropped every option it did
+not name, and had **already** been swallowing `graphRank`. Any graft option
+added since that wrapper was written has probably never reached `ask()` from the
+CLI; the retype makes that class of drop impossible rather than merely absent.
+
+Evidence:
+
+| claim | command | result |
+|---|---|---|
+| flag-off byte-identity, sidecar present | `env -u GRAFT_NO_REFRESH node --import tsx /build/eg2-bench/ab/parity.mts` | `flag-off parity: 240/240 byte-identical, 0 differ` |
+| same, at the scored limit of 50 | `... /build/eg2-bench/ab/audit/parity50.mts` | `FLAG-OFF PARITY @limit50: 240/240 byte-identical, 0 differ` / `avg hits returned: A=48.03 B_flagoff=48.03` |
+| full suite | `env -u GRAFT_NO_REFRESH TMPDIR=/build/eg2-bench/ab/tmp node --import tsx --test test/*.test.ts` | `tests 517 / pass 517 / fail 0 / skipped 0 / duration_ms 48843.6` |
+| the new tests alone | same, `test/ask-vector.test.ts` | `tests 24 / pass 24 / fail 0 / duration_ms 360.6` |
+| missing sidecar degrades, never throws | `env -u GRAFT_NO_REFRESH node --import tsx /build/eg2-bench/ab/guard12.mts` | `arm A (shipped) hit@5 = 12/12 OK` / `arm B (flag on, sidecar MISSING) hit@5 = 12/12, threw 0 times -> degrades to flag-off, no throw` |
+
+`env -u GRAFT_NO_REFRESH` is required on this box: `GRAFT_NO_REFRESH=1` is
+exported ambiently, `refresh.ts:63` then short-circuits `ensureFreshGraph`, and
+2 unrelated refresh tests fail. It is not a property of the vector channel.
+
+The guard probe also produced an independent confirmation of the version gap
+in §10.6: on the same 12 queries, arm A's gold ranks came back as
+`[3,4,1,2,1,1,3,1,1,1,1,1]` while the §1.2 baseline file recorded
+`[1,1,1,1,1,1,1,1,2,3,3,4]`. Same code path, different baseline.
+
+### 10.1 Headline: 240 queries, two corpora, seven weights
+
+Arm A is `ask` as shipped. Arm B is the same binary with the flag on. Both
+measured in-process against the same warm graph, 0 errors in every arm.
+
+```
+w      f@5      f@10     nodeHit@5  MRR@10   median
+0      0.9125   0.9458   0.8958     0.8149   35.4 ms
+1.5    0.9333   0.9417   0.9250     0.8435   37.8 ms
+```
+
+Per-cell file hit@5 (counts out of 40; entry-level, see §10.4):
+
+| cell | A | B | Δ |
+|---|---|---|---|
+| small_rs:q_bare | 38/40 | 38/40 | 0.0 |
+| small_rs:q_where | 38/40 | 38/40 | 0.0 |
+| small_rs:q_nl | 38/40 | 38/40 | 0.0 |
+| small_ts:q_bare | 33/40 | 36/40 | **+7.5pt** |
+| small_ts:q_where | 33/40 | 35/40 | **+5.0pt** |
+| small_ts:q_nl | 39/40 | 39/40 | 0.0 |
+
+Per-cell node MRR@10:
+
+| cell | A | B | Δ |
+|---|---|---|---|
+| small_rs:q_bare | 0.786 | 0.828 | +4.2 |
+| small_rs:q_where | 0.786 | 0.795 | +0.9 |
+| small_rs:q_nl | 0.921 | 0.900 | **−2.1** |
+| small_ts:q_bare | 0.734 | 0.800 | +6.6 |
+| small_ts:q_where | 0.732 | 0.812 | +8.0 |
+| small_ts:q_nl | 0.929 | 0.925 | −0.4 |
+
+All of §10.1 re-derived by `python3 -I /build/eg2-bench/ab/audit/recompute.py`
+over `per-query.json`; its output matches these tables exactly, so the run's
+own summary is reproducible rather than merely reported.
+
+### 10.2 The weight sweep, and the one number that should not be read as a signal
+
+| w | f@5 | f@10 | nodeHit@5 | MRR@10 | median (run 1) | median (run 2) |
+|---|---|---|---|---|---|---|
+| 0 | 0.9125 | 0.9458 | 0.8958 | 0.8149 | 35.4 ms | 36.4 ms |
+| 0.15 | 0.9208 | 0.9417 | 0.9042 | 0.8161 | 47.0 ms | 37.8 ms |
+| 0.30 | 0.9292 | 0.9375 | 0.9167 | 0.8230 | 47.7 ms | 39.6 ms |
+| 0.50 | 0.9292 | 0.9417 | 0.9167 | 0.8289 | 43.8 ms | 47.3 ms |
+| 0.75 | 0.9292 | 0.9417 | 0.9167 | 0.8376 | 34.9 ms | 46.6 ms |
+| 1.00 | 0.9292 | 0.9417 | 0.9167 | 0.8410 | 40.2 ms | 46.8 ms |
+| 1.50 | 0.9333 | 0.9417 | 0.9250 | 0.8435 | 37.8 ms | 44.6 ms |
+
+Quality is **bit-identical across both runs** at every weight; only latency
+moves. Two consequences:
+
+1. **f@5 is flat from 0.30 to 1.00.** All four of those arms score exactly
+   0.9292 (223/240). `VEC_WEIGHT = 1.5` is the argmax at 0.9333 (224/240) —
+   5 queries above arm A, but only **1 query** above w=0.5. A one-query margin
+   is not a margin that survives a different oracle sample. If a weight is
+   ever chosen, 1.5 is defensible as the measured argmax; 0.5 is equally
+   defensible on this curve.
+2. **The latency column is noise and must not be tuned on.** The same arm at
+   w=0.75 is 34.9 ms in run 1 and 46.6 ms in run 2 — an 11.7 ms swing that
+   exceeds the entire budget. Arm A itself moved 35.4 → 36.4 ms between runs.
+   The honest statement is "somewhere between −1 and +12 ms, not resolvable
+   with this harness", not "+2.3 ms at w=1.5".
+
+### 10.3 The pre-registered gate cannot be met on this baseline
+
+The run was gated against a rule registered before it: pooled file hit@5
++3.0pt over arm A. Every setting was rejected on that gate alone; gates 2-5
+(pass: no `q_bare` regression, pooled MRR@10 above A, no cell down more than
+5pt, latency inside 25 ms) passed at all seven weights. `stopping-rule-verify.py`
+prints `PRE-REGISTERED RULE: NO SHIP`.
+
+**Do not publish that NO SHIP as evidence against the channel.** The oracle
+union over the same per-query dump bounds what is winnable at all:
+
+```
+ORACLE UNION (A|B per-query) = 224/240 = 0.9333; A=219/240; headroom=5
+```
+
+Only 5 of 240 queries are winnable by *any* implementation on this baseline.
++3.0pt is 7.2 queries. The gate is therefore unsatisfiable by arithmetic, and
+B reaching exactly the union value means it captured 5/5 of the headroom that
+existed. The rule was calibrated against a weaker arm A (0.883) that had ~8.4pt
+of headroom; on the baseline actually measured it has 2.08pt.
+
+A second, independent reason the verdict is unsafe to quote: the rule is
+implemented in `stopping-rule-verify.py:35` as a *relative* test
+(`if d_f5 < 0.030`, where `d_f5` is measured against **this run's** arm A),
+while the registered form is an *absolute* threshold, `>= 0.913`, which is
+0.883 + 3.0pt. Under the absolute form, B@1.5 at 0.9333 **passes**. The
+substitution is invisible in `diff stopping-rule.py stopping-rule-verify.py`,
+which shows only the input-path line changing. Whoever re-derives these gates
+should re-check the semantics, not the diff.
+
+### 10.4 What the +2.1pt actually is — a metric artefact, not new retrieval
+
+The harness scores `files.slice(0, 5).includes(gtFile)` against a list with one
+entry per **result node**, not per distinct file. A single file that ranks five
+nodes occupies all five slots; the same file ranked once occupies one. That
+makes entry-level file hit@k strictly harsher than distinct-file hit@k, and it
+makes any reordering *within* an already-retrieved file look like a recall win.
+
+Recomputing both arms with the file list de-duplicated, order preserved:
+
+| metric | A | B | Δ |
+|---|---|---|---|
+| entry-level hit@5 (as scored) | 219/240 = 0.9125 | 224/240 = 0.9333 | **+5** |
+| **distinct-file hit@5** | 229/240 = 0.9542 | 230/240 = 0.9583 | **+1** |
+| entry-level hit@10 (as scored) | 227/240 = 0.9458 | 226/240 = 0.9417 | **−1** |
+| **distinct-file hit@10** | 229/240 = 0.9542 | 231/240 = 0.9625 | **+2** |
+
+Flipping the de-duplicated lists query by query, the entire distinct-file
+movement is:
+
+- **2 gains**, both the same query symbol — `guardFor` →
+  `tests/container-interior.test.ts`, in `small_ts:q_bare` and
+  `small_ts:q_where`. Arm A did not return that file at all; arm B returned it
+  at distinct-file rank 5.
+- **1 loss** — `small_rs:q_bare` `fmt` → `src/classifier/sensitive.rs`,
+  A rank 4 → B rank 6, pushed out of the top 5.
+
+The five entry-level "gains" are three query symbols (`listOf`,
+`interruptedTurn`, `logged`) in one repo, and every one is a pure slot
+promotion of a node arm A had already placed: gold-node ranks move **6→2,
+6→3, 6→4, 7→2, 7→4**. Not one of them is a file the lexical ranker failed to
+retrieve. So the honest reading of the headline is: **the vector channel
+reordered files the lexical ranker had already retrieved, and retrieved exactly
+one new file across 240 queries in one of two corpora.** Note also that the
+reported hit@10 regression is an artefact of the same counting rule — at
+distinct-file granularity hit@10 *improves* by 2.
+
+(The one genuinely new file, `guardFor`, is a case the other way round: arm B
+puts it at distinct-file rank 5 but its gold *node* still sits at rank 22-23.
+The file is findable; the specific definition is not. If a caller cares about
+the symbol rather than the file, this channel did not find it.)
+
+That is a real ranking effect and worth having. It is not evidence that
+embeddings find files lexical ranking misses, which is the claim §0 and §7.1
+were reaching for.
+
+### 10.5 Controls
+
+| control | result | reading |
+|---|---|---|
+| grep, same query set | `grep_baseline.json` → `small_rs 0.95`, `small_ts 0.975`, pooled **0.9625** | Neither arm clears it: A f@10 0.9458, B 0.9417. The vector blend does not beat a name match, and was already behind before it was added. N/A for `q_where`/`q_nl` — grep is name-only. |
+| flag-off parity | 240/240 byte-identical at limit 8 **and** at limit 50 | The §2.5 byte-identity claim holds mechanically with a valid sidecar on disk. |
+| missing sidecar | 12/12, 0 throws | Degrades to flag-off; §7.1's "must degrade to lexical-only, never to no answer" holds. |
+| mutation pins | 3 probes | Deleting `+ vecWeight * vecN` from ask.ts kills the single-scope pin and only that one; from fuse.ts, kills the multi-scope pin and only that one; reverting the `engine.ts` retype kills both forwarding tests. Each fails on its own line. |
+
+The grep control is the one this section should end on. Every quality gate
+passes, and the channel still does not beat `grep` on the benchmark's own
+queries.
+
+### 10.6 Confounds — four things invalidate this measurement as a ship decision
+
+1. **Wrong baseline.** This ran on worktree `d4ec9d7` (v0.8.2), not the live
+   checkout at `7b8acc5` (v0.9.0). `git rev-list --count d4ec9d7..7b8acc5`
+   → **72**, and `git diff --stat d4ec9d7 7b8acc5 -- src/ask/` →
+   `ask.ts` 59 lines changed, `fuse.ts` +8/−1, `index-file.ts` +2/−1. Those
+   are exactly the fusion and ranking files under test. Arm A already scores
+   0.9125 here against the 0.883 the protocol recorded for the live checkout,
+   and arm A's own hit@10 is 0.9458 here — so most of what the vector channel
+   was meant to win has already been banked by lexical/ranking work in those
+   72 commits. **Re-run arm A on `7b8acc5` before quoting any of these numbers
+   as a property of the channel.**
+2. **The embedded text is not what the design specifies.** The stored vectors
+   embed `crux.code` capped at 6000 chars; the draft's §3.3
+   (`/build/eg2-bench/design-embeddinggemma2.md`, "Embed-time input text")
+   specifies `title: {path} | text:` + signature + `summary` + definition body
+   from `node.span`, capped at ~2,000 chars. `body_text` is absent from
+   `wiring.json` on all 2814 nodes (stripped by `stripBodyText()`), so
+   `crux.code` was used as an offline proxy. Every recall number above is
+   measured against text the shipping encoder would never see. The title field
+   is also unpinned: the benchmark used the bare symbol name where the draft
+   says the path, and those two score cosine 0.953-0.963 against each other.
+3. **Latency is not comparable to the protocol's budget.** Measured in-process
+   and warm against a 35 ms baseline; the 25 ms gate was calibrated against a
+   344-584 ms CLI-subprocess baseline. The delta measurement is internally
+   sound (same process, same A) but "inside the 25 ms budget" is not a claim
+   this run can support.
+4. **Both corpora are single-scope.** The multi-scope blend is covered by the
+   `fuse.ts` unit test and one 2-scope synthetic fixture, never by a real
+   multi-scope benchmark. §2.4's claim that federation "keeps working
+   unchanged" is untested at scale.
+
+Two shipping surfaces are also deliberately absent: `graft ask` ships no
+encoder, so `--vector` consumes a caller-produced query-vector JSON, and there
+is no `graft embed` sidecar writer in the CLI — the sidecars used here were
+written by an offline script. Both are prerequisites for a real shipping path,
+not part of the fusion.
+
+### 10.7 Go / no-go
+
+**Recommendation: conditional GO — ship the flag, off by default. Do not enable
+the channel anywhere until the four §10.6 confounds are cleared.**
+
+Ship it, because the engineering half is real and paid for: the null-contract
+reader, the opt-in guard placement, byte-identical flag-off behaviour verified
+at two limits, the federation forwarding fix, and 24 tests including three
+mutation pins that each die on their own line. Every quality gate that could be
+measured passed at every weight. The one gate that failed failed for an
+arithmetic reason (§10.3), and the effect that did occur is a genuine ranking
+improvement in the corpus that §5.3 already identified as weakest.
+
+Do not enable it by default, because at distinct-file granularity the channel
+retrieved **one** file in 240 queries and lost one (§10.4), it does not beat
+`grep` (§10.5), and the effect was measured against a baseline 72 commits
+behind the one this document targets (§10.6). A default-on channel whose
+demonstrated contribution is reordering is a bad trade against 8.6 MB of bin
+read per query and an extra sidecar to keep fresh.
+
+Conditions, explicitly:
+
+| | |
+|---|---|
+| **Flag** | `--vector <weight[@path]>`, off by default. No config key in this pass; a config switch would outlive the evidence. |
+| **Weight** | `1.5` is the measured argmax and is fine to ship as the default *once enabled*. `0.5` is 1 query behind on a curve that is flat from 0.30 up, and is the better choice if anyone objects to the ceiling constant. Do not re-tune on the §10.2 latency column — it is noise. |
+| **Enable on** | ts-like corpora — those with a high head-only chunk share, where §5.3 showed pure-vector weakness and where both of the entry-level gains and the single distinct-file gain landed. |
+| **Leave off** | rs-like corpora. All three small_rs cells are frozen at 38/40 with zero movement, and at distinct-file granularity the channel *loses* a file there (`fmt`). There is no evidence of benefit and one small measured cost. |
+| **Query text** | Gains landed only on the `q_bare` and `q_where` forms in ts; `q_nl` moved zero in every cell of both corpora. Do not read that as evidence about NL queries in general — §10.4 shows the whole gain is rank-order within already-retrieved files, and §10.6(2) means the embedded text was not the design's text. It is one more reason the "paraphrase queries get a match lexical cannot provide" motivation of §0 remains unproven by this run. |
+
+Work required before anyone flips it on, in order:
+
+1. **Re-run arm A on `7b8acc5`.** Everything in §10.1-§10.5 is relative to a
+   displaced baseline. On the current code the headroom may be zero, in which
+   case this section's conclusion is settled by that and nothing else is
+   worth running.
+2. **Re-run with the draft's §3.3 embed-time text**, i.e. an encoder run over
+   `title + signature + summary + span body` at ~2,000 chars. This requires a
+   sidecar writer in the CLI, which does not exist yet.
+3. **Score at distinct-file granularity** as well as entry-level. Report both.
+   Entry-level counts 5 queries of gain here; distinct-file counts 1.
+4. **Fix the gate before re-registering it.** Absolute `>= 0.913`, derived
+   from the arm A actually used, applied to the arm A actually used — and
+   recompute the union ceiling on that baseline rather than inheriting +8.4pt.
+5. **One multi-scope corpus**, since §2.4's federation claim is still untested
+   at scale and the multi-scope blend has never seen real multi-scope traffic.
+
+If (1) shows the headroom on `7b8acc5` is under ~2pt, the correct outcome is to
+ship the flag, document it, and leave it off indefinitely — the flag-off
+byte-identity guarantee makes that a cheap option, which is most of why this
+recommendation is safe.
+
 ## Appendix A: artifact map
 
 | path | contents |
@@ -532,6 +863,16 @@ Standalone sidecar first; no committed-data changes at any step.
 | `bench-gpu/win_small_rs.npy` + `{convert_ir.py, eg2_gate.py}` | §5.4.1 validated-route artifacts (2814×768 f32, conversion + gate scripts, copies on both boxes) |
 | `/build/eg2-bench/data/graft-ask-baseline.json` | 12-query graft `ask` baseline (§1.2) |
 | `/build/eg2-bench/venv/` | CPython 3.12.13; onnxruntime 1.31.0 CPUExecutionProvider, transformers 5.19.0 |
+| `/build/eg2-bench/design-embeddinggemma2.md` | the earlier draft; §3.3 is the canonical embed-time input text that §10.6(2) compares against |
+| `/build/eg2-bench/ab/ask-ab.mts`, `ab-verify.json`, `ab-results.json` | §10 A/B driver and its two runs. `ab-results.json` = original run, `ab-verify.json` = independent re-run. Quality is identical in both; only latency differs (§10.2) |
+| `/build/eg2-bench/ab/per-query.json` | 240 rows × full ranked file/node lists for both arms — the substrate for every §10 number |
+| `/build/eg2-bench/ab/audit/recompute.py` | independent recomputation of §10.1-§10.4 from `per-query.json`, including the distinct-file pass |
+| `/build/eg2-bench/ab/parity.mts`, `audit/parity50.mts` | flag-off byte-identity at limit 8 and at the scored limit 50 |
+| `/build/eg2-bench/ab/guard12.mts` | missing-sidecar degradation probe (12 queries, `graft_src`, no sidecar) |
+| `/build/eg2-bench/ab/stopping-rule.py`, `stopping-rule-verify.py`, `ceiling.py`, `ceiling-verify.py`, `analyze.py` | the registered 5-gate rule and the oracle-union ceiling — see §10.3 for why the gate's verdict is not quotable |
+| `/build/eg2-bench/ab/make-sidecars.py` | offline sidecar writer from the benchmark's stored vectors; stands in for the `graft embed` writer that does not exist yet (§10.6) |
+| `/build/eg2-bench/bench-quality/grep_baseline.json` | `{"small_rs": 0.95, "small_ts": 0.975}` — the grep control in §10.5 |
+| `/build/worktrees/graft_src/eg2-fusion-ab` | the implementation worktree, on `d4ec9d7` (v0.8.2). **Not merged.** 517/517 tests pass there; the branch is `ab/vector-fusion` |
 
 Verification commands run while writing this document (all numbers above
 re-checked against artifacts): census totals from `census_results.json`
