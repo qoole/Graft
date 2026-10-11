@@ -9,7 +9,10 @@ at `@nanonets/graft` 0.9.0 and were spot-checked while writing.
 flagged `[RESOLVED]` / `partially answered` (§5.5 first bullet, §9 item 1).
 §10 was added 2026-10-11 and reports the fused-ranking A/B; §3's `src/ask/`
 line numbers are still cited against 0.9.0 and have **not** been re-pinned
-against the §10 implementation worktree — re-pin before merge.**
+against the §10 implementation worktree — re-pin before merge. §10.8 was added
+later the same day and reports the same A/B re-run on the live baseline
+`7b8acc5`; it supersedes four claims, each marked `[SUPERSEDED — §10.8]` in
+place and listed in §10.8.8.**
 
 ## 0. TL;DR
 
@@ -36,14 +39,25 @@ importer entirely (§5.4).
 **Addendum 2026-10-11 (§10): the fusion has now been built and measured.** A
 flag-gated linear blend (`VEC_WEIGHT`, sidecar read inside the opt-in guard,
 byte-identical output with the flag off) passes 240 oracle queries on small_rs
-+ small_ts at every weight swept. Measured best `VEC_WEIGHT = 1.5`: pooled
-file hit@5 0.912 → 0.933, node hit@5 0.896 → 0.925, node MRR@10 0.815 → 0.844,
-at a cost of +2-12 ms median latency (noisy; see §10.5). The measured effect
-is small, concentrated in one of two corpora, and mostly *reorders* files the
-lexical ranker had already retrieved rather than finding new ones. §10 does
-**not** clear the channel for default-on shipping: it recommends an opt-in
-`--vector` flag, off by default, on ts-like corpora only, and states the four
-confounds that would have to be re-run before anyone turns it on by default.
++ small_ts at every weight swept. On the 0.8.2 worktree the best weight gave
+pooled **entry-level** file hit@5 0.912 → 0.933, node hit@5 0.896 → 0.925 and
+node MRR@10 0.815 → 0.844 at a cost of +2-12 ms median latency (noisy; see
+§10.5). §10.4 then showed the file-metric part of that is a counting artefact:
+at **distinct-file** granularity the same run moved **+1** query, not +5.
+
+**Addendum 2026-10-11, second pass (§10.8): re-run on the live baseline
+`7b8acc5`, the file-metric gain reverses.** Scoring the same 240 queries as
+distinct files — the metric §10.4 established as the correct one — the channel
+performs **zero** new retrievals at every weight from 0.15 to 1.5, and every
+hit@5 and hit@10 movement is a loss: distinct-file hit@5 goes 219/240 (arm A)
+→ 217 at w≥1.0, hit@10 221 → 219 at every weight. At the level of the whole
+top-50, no gold file enters at any weight and 2-6 are pushed out, 100% of them
+test files. The union over every arm and weight is 229/240, exactly what arm A
+already reaches, so the headroom for this corpus is **zero**. The node-level
+effect survives and is real (node hit@5 208 → 211; MRR@10 0.789 → 0.813,
+strictly monotone in weight), but it ranks symbols inside files the lexical
+ranker had already retrieved. **Recommendation: ship the flag, off by default,
+as a resting state rather than a pending decision.**
 
 ## 1. Problem: what indexing and retrieval cost today
 
@@ -418,10 +432,14 @@ q_nl recall@1 by +27.5 points over the int8 pipeline.
   end-to-end fused ranking had never been run. It has now: a flag-gated linear
   blend, `VEC_WEIGHT` swept over 7 settings, 240 queries across small_rs +
   small_ts. §10 reports the result, including that the pre-registered gate
-  could not be met on the baseline that was measured. §5.3 still measures pure
+  could not be met on the baseline that was measured, and §10.8 repeats the
+  measurement on the live baseline `7b8acc5`, where the distinct-file effect is
+  −2 at every weight rather than +1 (§10.8.4). §5.3 still measures pure
   vector retrieval only, and the 12-query baseline in §1.2 is still
   baseline-only; the draft's original "vectors beat graft's rank" TL;DR claim
-  remains withdrawn as untested on its own terms.
+  remains withdrawn as untested on its own terms — and after §10.8 it is
+  withdrawn as **contradicted** on the file-selection metric, which is the
+  stronger of the two available readings.
 - int8-vs-fp32 full-eval quality delta at 768d: **partially resolved** —
   §5.4.2 measured it on small_rs (fp16 wins q_nl recall@1 by +27.5 points);
   small_ts and the other repos still unmeasured on exact vectors.
@@ -505,6 +523,13 @@ Standalone sidecar first; no committed-data changes at any step.
 3. **Fusion behind a flag** (`ask --vectors` / config): `VEC_WEIGHT·vecN`
    term per §2.4, tuned on the golden set; A/B the RRF variant (§2.4)
    against the linear blend.
+   **[§10.8: the flag shape is unchanged and still recommended — shipped, off
+   by default. What changed is that the tuning step is now blocked rather than
+   merely deprioritised. On `7b8acc5` no weight beats arm A at distinct-file
+   granularity and the oracle's headroom is zero (§10.8.7), so there is nothing
+   on *this* golden set left to tune toward. Ship the flag; do not enable it
+   until a corpus with headroom exists and the `testFactor` interaction
+   (§10.8.6) has been resolved.]**
 4. **`build --deep` chain** after `writeAskIndex` once (1)-(3) hold.
 5. **GPU now validated, adopt alongside step 1** for graphs where CPU is
    the bottleneck: the §5.4.1 route (OpenVINO fp16 IR via
@@ -517,16 +542,28 @@ Standalone sidecar first; no committed-data changes at any step.
 
 ## 9. Open questions
 
-1. `VEC_WEIGHT` and RRF-vs-linear: **partially answered (§10).** The linear
-   blend is built and swept; `VEC_WEIGHT = 1.5` is the measured best on the
-   benchmark, but the curve is flat from 0.30 to 1.5 and the measured effect
-   is small enough that §10 recommends shipping it opt-in rather than tuned.
-   **Still open: RRF-vs-linear.** The RRF variant named in §2.4 was not built
-   or run — Stage 1 was declared saturated against the oracle-union ceiling
-   (0.933), which made the later protocol stages moot on *this* baseline. If
-   that baseline is ever re-run on a weaker arm A, RRF becomes live again.
-   Still outstanding: the golden-set harness ported into graft's test suite
-   (`test/ask.test.ts` pattern).
+1. `VEC_WEIGHT` and RRF-vs-linear: **answered for the linear blend on the live
+   baseline (§10.8); RRF still open.** The linear blend is built and swept on
+   `7b8acc5`. On the correct distinct-file metric **no weight beats arm A** —
+   `VEC_WEIGHT = 1.5` is the argmax only for node MRR@10 (0.7891 → 0.8127,
+   monotone), while distinct-file hit@5 goes 219 → 217. So the earlier "1.5 is
+   the measured best" claim was a statement about a displaced baseline
+   (`d4ec9d7`) and is withdrawn. The corpus cannot answer the question further:
+   arm A reaches 229/240 gold files in the top-50 and the union over every arm
+   and weight is also 229, so headroom is zero (§10.8.7) — **a bigger oracle is
+   a prerequisite for any future weight-tuning claim, not an optional extra.**
+   **Still open: RRF-vs-linear.** The RRF variant named in §2.4 was never built
+   or run. Stage 1 was declared saturated against the oracle-union ceiling
+   (0.933 on `d4ec9d7`, 0.954 on `7b8acc5`), which makes the later protocol
+   stages moot on *this* baseline; RRF becomes live again only against a corpus
+   with real headroom. Still outstanding: the golden-set harness ported into
+   graft's test suite (`test/ask.test.ts` pattern).
+   **Newly open (§10.8.6): the vector term sits inside the parentheses that
+   `testFactor` multiplies** (`ask.ts:787`, `fuse.ts:273-274`), so it raises the
+   penalised score of test files as much as anyone else's. Every file-level
+   loss the channel produces is a test file. Moving the term outside the
+   multiply is the concrete next experiment, and it is a design change rather
+   than a weight.
 2. Asymmetric query prompt (`task: code retrieval | query:`) — expected few
    points up; measure after the chunk fix.
 3. Stale-vector policy: de-weight vs drop.
@@ -718,6 +755,15 @@ Recomputing both arms with the file list de-duplicated, order preserved:
 | entry-level hit@10 (as scored) | 227/240 = 0.9458 | 226/240 = 0.9417 | **−1** |
 | **distinct-file hit@10** | 229/240 = 0.9542 | 231/240 = 0.9625 | **+2** |
 
+> **[SUPERSEDED — §10.8] The `+1` on distinct-file hit@5 and the `+2` on
+> hit@10 are properties of the `d4ec9d7` baseline, not of the channel.** Re-run
+> on the live baseline `7b8acc5` with the same 240 queries and the same
+> driver, the same metric gives **−2** on both (§10.8.4). The `+1` above should
+> be read as "one query, on one baseline", not as the channel's effect. The rest
+> of §10.4 — the counting-artefact argument, the per-query flip list, and the
+> conclusion that the movement is reordering rather than retrieval — is
+> confirmed by §10.8.3 and unchanged.
+
 Flipping the de-duplicated lists query by query, the entire distinct-file
 movement is:
 
@@ -746,6 +792,12 @@ the symbol rather than the file, this channel did not find it.)
 That is a real ranking effect and worth having. It is not evidence that
 embeddings find files lexical ranking misses, which is the claim §0 and §7.1
 were reaching for.
+
+> **[SUPERSEDED — §10.8] "retrieved exactly one new file across 240 queries" is
+> true of `d4ec9d7` and false on the live baseline.** On `7b8acc5` the channel
+> retrieves **zero** new gold files at any weight, at either the top-5/top-10
+> boundary or across the whole top-50, and the `guardFor` gain does not
+> reproduce (§10.8.3).
 
 ### 10.5 Controls
 
@@ -800,6 +852,15 @@ not part of the fusion.
 
 ### 10.7 Go / no-go
 
+> **[SUPERSEDED — §10.8] Read this section as the `d4ec9d7` verdict.** Its own
+> work item (1) — "re-run arm A on `7b8acc5`" — has since been done, and the
+> answer is negative on every weight at the correct metric (§10.8.4). The
+> *outcome* below ("ship the flag, off by default") is unchanged and is now
+> final; the *reason* has changed from "conditional, pending four confounds" to
+> "measured, and negative". §10.8.8 restates the recommendation against the live
+> baseline. In particular the **Enable on: ts-like corpora** row below is
+> **withdrawn** — on `7b8acc5` all six top-50 losses land in `small_ts`.
+
 **Recommendation: conditional GO — ship the flag, off by default. Do not enable
 the channel anywhere until the four §10.6 confounds are cleared.**
 
@@ -823,8 +884,8 @@ Conditions, explicitly:
 | | |
 |---|---|
 | **Flag** | `--vector <weight[@path]>`, off by default. No config key in this pass; a config switch would outlive the evidence. |
-| **Weight** | `1.5` is the measured argmax and is fine to ship as the default *once enabled*. `0.5` is 1 query behind on a curve that is flat from 0.30 up, and is the better choice if anyone objects to the ceiling constant. Do not re-tune on the §10.2 latency column — it is noise. |
-| **Enable on** | ts-like corpora — those with a high head-only chunk share, where §5.3 showed pure-vector weakness and where both of the entry-level gains and the single distinct-file gain landed. |
+| **Weight** | `1.5` is the measured argmax and is fine to ship as the default *once enabled*. `0.5` is 1 query behind on a curve that is flat from 0.30 up, and is the better choice if anyone objects to the ceiling constant. Do not re-tune on the §10.2 latency column — it is noise. **[§10.8: on `7b8acc5` no weight in 0.15-1.5 beats arm A on distinct-file, so this row is moot until the flag is enabled for node-ranking reasons.]** |
+| **Enable on** | ts-like corpora — those with a high head-only chunk share, where §5.3 showed pure-vector weakness and where both of the entry-level gains and the single distinct-file gain landed. **[WITHDRAWN — §10.8: on `7b8acc5` all six top-50 losses are in `small_ts`, and there is no corpus in this benchmark for which the channel is a net positive on file selection.]** |
 | **Leave off** | rs-like corpora. All three small_rs cells are frozen at 38/40 with zero movement, and at distinct-file granularity the channel *loses* a file there (`fmt`). There is no evidence of benefit and one small measured cost. |
 | **Query text** | Gains landed only on the `q_bare` and `q_where` forms in ts; `q_nl` moved zero in every cell of both corpora. Do not read that as evidence about NL queries in general — §10.4 shows the whole gain is rank-order within already-retrieved files, and §10.6(2) means the embedded text was not the design's text. It is one more reason the "paraphrase queries get a match lexical cannot provide" motivation of §0 remains unproven by this run. |
 
@@ -833,7 +894,9 @@ Work required before anyone flips it on, in order:
 1. **Re-run arm A on `7b8acc5`.** Everything in §10.1-§10.5 is relative to a
    displaced baseline. On the current code the headroom may be zero, in which
    case this section's conclusion is settled by that and nothing else is
-   worth running.
+   worth running. **[DONE — §10.8. Headroom is zero: arm A reaches 229/240
+   gold files in the top-50 and the union over every arm and weight is also
+   229. The conclusion is settled by that, and it is negative.]**
 2. **Re-run with the draft's §3.3 embed-time text**, i.e. an encoder run over
    `title + signature + summary + span body` at ~2,000 chars. This requires a
    sidecar writer in the CLI, which does not exist yet.
@@ -849,6 +912,285 @@ If (1) shows the headroom on `7b8acc5` is under ~2pt, the correct outcome is to
 ship the flag, document it, and leave it off indefinitely — the flag-off
 byte-identity guarantee makes that a cheap option, which is most of why this
 recommendation is safe.
+
+> **This condition has fired.** Measured headroom on `7b8acc5` is **0**, not
+> ~2pt (§10.8.7). See §10.8 for the full re-run and §10.8.8 for the
+> recommendation restated against this baseline.
+
+### 10.8 The live-baseline re-run (`7b8acc5`): the distinct-file gain reverses
+
+Added 2026-10-11, later the same day. This subsection discharges §10.7's work
+item (1) — "re-run arm A on `7b8acc5`" — and it is the finding that settles §10.
+It **supersedes four specific claims**; each is corrected in place above and
+listed in §10.8.8. Everything else in §10.1-§10.7 stands as a report of the
+`d4ec9d7` run and is left alone.
+
+Three things differ between the two runs, and only one of them is the channel:
+
+1. **The base.** `d4ec9d7` (0.8.2) → `7b8acc5` (0.9.0), the 72 commits §10.6(1)
+   already flagged.
+2. **The port.** The channel was hand-ported onto the new base rather than
+   copied, because the blend line had moved. Worktree
+   `/build/worktrees/graft_src/eg2-ab-7980`, branch `ab/vector-fusion-7980` at
+   `c0e3c08`. The port preserved the base's test-file de-rank instead of
+   overwriting it — see §10.8.6.
+3. **The scoring line.** The old driver mapped every ranked *node* to its path
+   and sliced the first five *entries*, so five nodes from one file read as
+   five "files" and a pure slot reorder inside a single file scored as a gain.
+   §10.4 diagnosed that; this run fixes it in the driver. The scoring line, and
+   nothing else that affects a metric:
+
+   ```
+   $ diff -u /build/eg2-bench/ab/ask-ab.mts /build/eg2-bench/ab7980/ask-ab.mts
+   @@ -108,7 +108,13 @@
+   -  const files = ranked.map((id) => pathOfNode("", id));
+   +  // SCORING FIX (the only metric change vs the 0.8.2 driver): the file metric is
+   +  // a DISTINCT-FILE metric. ...
+   +  const files = [...new Set(ranked.map((id) => pathOfNode("", id)))];
+   ```
+
+   The other three hunks are the import path and two count-reporting additions.
+   `Set` preserves first-occurrence order, so "top 5 distinct files" is
+   rank-stable. The fix is **symmetric across both arms** — both go through the
+   same `score()` — and in fact it helps arm A more than arm B (7980 arm A
+   entry-level 211 vs distinct 219, +8; arm B at w=1.5 entry 213 vs distinct
+   217, +4). A fix that biased toward the channel cannot have manufactured a
+   negative result.
+
+#### 10.8.1 Guarantees re-verified on the new base
+
+The engineering guarantees are not in question here — they were re-established
+on `7b8acc5`, not inherited from `d4ec9d7`:
+
+| claim | command | result |
+|---|---|---|
+| full suite on the ported tree | `cd /build/worktrees/graft_src/eg2-ab-7980 && env -u GRAFT_NO_REFRESH TMPDIR=/build/eg2-bench/ab7980/tmp node --import tsx --test test/*.test.ts` | `tests 669 / pass 669 / fail 0 / skipped 0 / duration_ms 45066.357456` (captured in `/build/eg2-bench/ab7980/full-tests.txt`) |
+| flag-off parity vs a pristine `7b8acc5` export | `env -u GRAFT_NO_REFRESH node --import tsx /build/eg2-bench/ab7980/parity.mts` | `flag-off parity: 240/240 byte-identical, 0 differ`; `parity.json` = `{"n":240,"diff":0,"nonEmpty":240}` |
+| sidecars match the current graphs | `python3 -I /build/eg2-bench/ab7980/validate-sidecars.py` | `small_rs: ids=2814 wiring=2814 dim=768 bin=8644608B [OK]` / `small_ts: ids=3090 wiring=3090 dim=768 bin=9492480B [OK]` / `ALL SIDECARS VALID`, exit 0 |
+| arm A is unpatched behaviour | `cd /build/eg2-bench/ab7980 && env -u GRAFT_NO_REFRESH TMPDIR=.../verify/tmp node --import /build/worktrees/graft_src/eg2-ab-7980/node_modules/tsx/dist/loader.mjs verify/base-repro.mts` | `BASE(7b8acc5 pristine) vs dump armA: sample=80 identical=80 differs=0` |
+
+That last row matters more than the other two. The driver passes arm A no vector
+option at all (`ask-ab.mts:175` — "Arm A passes NO vector options at all"), but a
+comment is not a check, so arm A's 80 sampled queries were re-run against a
+pristine `git archive 7b8acc5` export and compared to the dump's `aNodes`
+node-for-node: 80/80 identical. If the port had contaminated arm A, this would
+diverge.
+
+#### 10.8.2 The sweep on `7b8acc5`, scored as distinct-file
+
+Same 240 queries, same two corpora, same driver modulo the scoring fix above.
+Counts are absolute (one query is 0.42pt pooled, 2.5pt on a 40-query cell);
+rates are for comparison with §10.2.
+
+```
+$ env -u GRAFT_NO_REFRESH TMPDIR=/build/eg2-bench/ab7980/tmp \
+    node --import /build/worktrees/graft_src/eg2-ab-7980/node_modules/tsx/dist/loader.mjs \
+    ask-ab.mts /build/eg2-bench/ab7980/ab-results.json 0,0.15,0.3,0.5,0.75,1.0,1.5
+```
+
+| w | distinct f@5 | Δf@5 | distinct f@10 | Δf@10 | node hit@5 | Δnode | MRR@10 | median |
+|---|---|---|---|---|---|---|---|---|
+| 0 (arm A) | 219/240 | — | 221/240 | — | 208/240 | — | 0.7891 | 43.0 ms |
+| 0.15 | 218/240 | **−1** | 219/240 | **−2** | 208/240 | 0 | 0.7900 | 48.2 ms |
+| 0.30 | 218/240 | **−1** | 219/240 | **−2** | 210/240 | +2 | 0.7961 | 47.4 ms |
+| 0.50 | 218/240 | **−1** | 219/240 | **−2** | 210/240 | +2 | 0.8004 | 44.9 ms |
+| 0.75 | 218/240 | **−1** | 219/240 | **−2** | 210/240 | +2 | 0.8087 | 55.3 ms |
+| 1.00 | 217/240 | **−2** | 219/240 | **−2** | 210/240 | +2 | 0.8116 | 45.3 ms |
+| 1.50 | 217/240 | **−2** | 219/240 | **−2** | 211/240 | +3 | 0.8127 | 58.3 ms |
+
+0 errors in every arm; total wall time for the 7-arm sweep 1m32s.
+
+**Not one weight produces a single distinct-file gain.** f@5 gains = 0 at every
+weight; f@10 gains = 0 at every weight. All movement is loss.
+
+#### 10.8.3 Stronger than the top-k view: zero new retrievals in the whole top-50
+
+§10.4 and §10.7 argue at the top-5/top-10 boundary. The result is cleaner at the
+level of the retrieved set, because the top-50 is what `ask` actually returns.
+Deduplicating the **full 50-entry** node list and asking whether the gold file
+enters or leaves it at all:
+
+| w | gold files newly **entering** the top-50 | gold files pushed **out** of the top-50 | of those, test files |
+|---|---|---|---|
+| 0.15 | **0** | 2 | 2 |
+| 0.30 | **0** | 2 | 2 |
+| 0.50 | **0** | 4 | 4 |
+| 0.75 | **0** | 6 | 6 |
+| 1.00 | **0** | 6 | 6 |
+| 1.50 | **0** | 6 | 6 |
+
+Zero entries at every weight, monotone in weight on the losses, and **100% of
+the losses are test files** — `tests/quarantine_flow.rs` (small_rs,
+`pending_mode_is_detectable_by_caller`), `tests/badwolf-run.test.ts`
+(small_ts, `groupsLeft`) and `tests/seed.test.ts` (small_ts, `temp`). The
+channel's only measurable effect on the set of files it retrieves is subtractive,
+and every query it subtracts is a test-file gold answer.
+
+Both the sweep and this table come from one re-derivation, written for this
+subsection, which reads only the raw per-query dump and imports nothing from the
+run's own analysis:
+
+```
+$ python3 -I /build/eg2-bench/ab7980/docverify/recompute.py \
+    /build/eg2-bench/ab7980/per-query.json
+  w=1.5  distinct f@5=217/240 f@10=219/240 | entry f@5=213/240 | nodeHit@5=211/240 MRR@10=0.8127 | dF5=-2 dF10=-2 dE5=+2 dN5=+3
+  w=1.5  f@5   GAINS=0  | LOSSES=2 ['small_rs/q_bare/fmt', 'small_ts/q_where/salad']
+  w=1.5  gold entered top-50=0  | pushed OUT of top-50=6 of which test files=6
+```
+
+Every cell of §10.8.2 and §10.8.3 reproduces the driver's own pooled table
+(`/build/eg2-bench/ab7980/ab-run.txt`) digit for digit.
+
+#### 10.8.4 The honest cross-base comparison: +1 → −2
+
+§10.4 reported `+1` distinct-file query on `d4ec9d7`. The same weight, the same
+240 queries, both arms re-run on `7b8acc5`:
+
+```
+$ python3 -I /build/eg2-bench/ab7980/docverify/crossbase.py \
+    /build/eg2-bench/ab/per-query.json /build/eg2-bench/ab7980/per-query.json
+```
+
+| metric @ w=1.5 | `d4ec9d7` A → B | Δ | `7b8acc5` A → B | Δ |
+|---|---|---|---|---|
+| **distinct-file hit@5** | 229 → 230 | **+1** | 219 → 217 | **−2** |
+| **distinct-file hit@10** | 229 → 231 | **+2** | 221 → 219 | **−2** |
+| entry-level hit@5 | 219 → 224 | +5 | 211 → 213 | +2 |
+| node hit@5 | 215 → 222 | +7 | 208 → 211 | +3 |
+| MRR@10 | 0.8149 → 0.8435 | +0.0286 | 0.7891 → 0.8127 | +0.0236 |
+
+The distinct-file gain does not shrink toward noise — it crosses zero. The node
+gains survive the base change but roughly halve.
+
+Note that the metric definition flips the sign of the headline: on
+entry-level the channel gains 2 queries on the new base, on distinct-file it
+loses 2. §10.4 already established distinct-file as the correct metric. At the
+correct metric, on the base this document targets, the effect is negative.
+
+#### 10.8.5 The confound is arm A, not the channel
+
+The reversal is confounded, and the confound is arm A itself:
+
+```
+arm A distinct f@5 moving 0.8.2 -> 7b8acc5:  LOST=10  GAINED=0  of the lost, test files=10
+```
+
+All ten of arm A's losses are test files — `tests/quarantine_flow.rs`,
+`tests/badwolf-run.test.ts`, `tests/runner.test.ts` (×6). Zero gained. Arm A
+went from 229 to 219 because of the base's own test-file de-ranking
+(`TEST_RANK_PENALTY = 0.35`, `ask.ts:199`), and the oracle is test-heavy
+precisely in the `small_ts` `q_bare`/`q_where` cells. So the base spent the
+headroom the channel was being measured against.
+
+This is why the paired comparison in §10.8.4 is the only sound one: **both
+arms were re-run on `7b8acc5`**. A cross-tree comparison of `d4ec9d7`'s arm B
+against `7b8acc5`'s arm A would have conflated the channel with the base and
+could not have distinguished "the channel lost" from "the base moved".
+
+#### 10.8.6 What the channel does buy, and the mechanism that explains the loss
+
+The node-level effect is real and monotone in weight. Pooled MRR@10 is strictly
+increasing at every step — 0.7891, 0.7900, 0.7961, 0.8004, 0.8087, 0.8116,
+0.8127 for w = 0 → 1.5, i.e. **+0.0236** — and pooled node hit@5 is monotone
+non-decreasing, 208 → 208 → 210 → 210 → 210 → 210 → 211 (flat at w=0.15, +2 from
+w=0.30, +3 at w=1.5). On the per-cell breakdown at w=1.5 the gains are
+`small_rs:q_bare` 36→37, `small_ts:q_bare` 31→32 and `small_ts:q_where` 31→32,
+everything else flat.
+
+There is a concrete, checkable mechanism behind the file-metric loss, and it is
+a porting decision rather than a tuning parameter. In both blend sites the
+vector term sits **inside** the parentheses that the test-file penalty
+multiplies:
+
+```
+$ grep -n 'vecWeight \* vecN' /build/worktrees/graft_src/eg2-ab-7980/src/ask/ask.ts
+787:      (lexN + GRAPH_WEIGHT * (pr.get(id) ?? 0) + vecWeight * vecN) * testFactor(n.path);
+$ grep -n 'vectorWeight \* vecN' /build/worktrees/graft_src/eg2-ab-7980/src/ask/fuse.ts
+273:        (lexN + graphWeight * (pr.get(id) ?? 0) + vectorWeight * vecN) *
+274:        (ops.rankFactor?.(scope, id) ?? 1);
+```
+
+Raising the vector term therefore raises the *penalised* score of a test file
+exactly as it raises everyone else's, and every file the channel pushes down is
+a test file (§10.8.3) while every node metric rises monotonically. That is the
+predicted signature, observed without exception. Moving the term outside the
+product — `(lexN + graphWeight*pr + vecWeight*vecN*testFactor)` — is the obvious
+thing to try next, and it is a design question, not a weight to tune.
+
+#### 10.8.7 The ceiling is zero on this corpus
+
+Computed from the actual per-query top-50 file sets, not assumed:
+
+```
+covered by A (top-50): 229/240  | covered by ANY B weight: 227/240  | UNION: 229/240  => headroom for any B = 0
+```
+
+Arm A alone already reaches 229 of the 240 gold files, and the union over every
+arm and every weight is the same 229. §10.3 made the analogous point on the old
+base — there the ceiling was 224 with arm A at 219, so 5 queries were winnable
+and the channel captured 5 of 5. Here there is nothing to capture.
+
+The 11 unreachable queries are named in `recompute.py`'s output; 8 of them are
+`small_ts` test-file targets (`guardFor`, `temp` ×2, `interruptedTurn` ×3,
+`logged`). Two further caveats bound how much "240" is worth. First, the oracle
+is **240 rows but 237 distinct `(repo, form, symbol)` keys**: three of the rows
+are duplicate keys, `small_ts` `temp` in each of the three forms, and each such
+row is scored against a *different* gold file (`tests/loop-guard.test.ts#temp`
+and `tests/seed.test.ts#temp`). So one bare/where-style symbol query is scored
+twice against two different answers, one of which is effectively unwinnable.
+Second, both corpora are still single-scope, so §10.6(4) is untouched by this
+run.
+
+The practical consequence: **no further file-metric A/B on these 240 queries can
+evidence a gain.** The metric is exhausted. It can only register regression. Any
+future retrieval-quality claim needs a corpus sized against the ceiling first.
+
+#### 10.8.8 Verdict change, and what it supersedes
+
+§10.7's pre-committed condition was: *"If (1) shows the headroom on `7b8acc5` is
+under ~2pt, the correct outcome is to ship the flag, document it, and leave it
+off indefinitely."* The measured headroom is **0**. The condition fires, and it
+fires on the harsh side: not "under 2pt", but negative at every weight tried,
+with no weight at which the channel is even neutral on the correct metric.
+
+**Recommendation after this run: ship the flag, off by default, and treat
+"off" as the resting state rather than a pending decision.** Restated against
+this baseline:
+
+- **Do not enable.** Two runs on two different bases agree the distinct-file
+  effect is ~1 query in magnitude, and the sign of that one query is a property
+  of the baseline, not of the channel. This is the ceiling of the available
+  headroom, not a tuning failure: there is no weight in 0.15-1.5 that recovers
+  it, and no weight outside that range on this evidence either.
+- **Ship the flag.** The engineering half is unchanged and still verified on the
+  new base: null-contract reader, opt-in guard placement, 240/240 byte-identical
+  flag-off with a valid sidecar on disk, and 669 passing tests.
+- **Enable on: nothing, yet.** §10.7 recommended ts-like corpora specifically
+  because the gains landed there. On the new base the ts cells are where *all six*
+  top-50 losses land, and the rs cell is the one that loses a top-5 query. There
+  is no corpus in this benchmark for which the channel is a net positive on file
+  selection.
+- **What would change the answer:** a corpus with headroom (§10.8.7); the vector
+  term moved outside the `testFactor` multiply (§10.8.6); or a decision that the
+  node-level ranking gain (+0.024 MRR@10, monotone, reproduced on two bases) is
+  worth more than the file-selection loss. That last one is a product judgement,
+  not a measurement — and it should be made knowing the A/B as specified measures
+  the *first* of those two things, not the second.
+
+Superseded claims, each corrected in place above:
+
+| § | was | now |
+|---|---|---|
+| §0 TL;DR | file hit@5 0.912 → 0.933 | entry-level on `d4ec9d7`; on `7b8acc5` distinct-file is 0.9125 → 0.9042 |
+| §10.4 | "+1 distinct-file, and exactly one new file (`guardFor`)" | on `7b8acc5`: **−2** distinct-file and **zero** new files at any weight |
+| §10.7 | "conditional GO — do not enable until the four confounds are cleared" | confound (1) is cleared and the answer is negative; "ship off, resting state" |
+| §9.1 | "`VEC_WEIGHT = 1.5` is the measured best" | 1.5 is best only for node MRR; no weight beats arm A on distinct-file |
+
+Unchanged and still true: §10.2's latency column is noise (§10.8.2's median
+column repeats the non-monotonicity), §10.5's grep control still stands — neither
+arm clears it on either base — and §10.6(2)'s embed-time-text confound, (3)'s
+latency-comparability confound and (4)'s single-scope confound all survive
+untested.
 
 ## Appendix A: artifact map
 
@@ -873,6 +1215,15 @@ recommendation is safe.
 | `/build/eg2-bench/ab/make-sidecars.py` | offline sidecar writer from the benchmark's stored vectors; stands in for the `graft embed` writer that does not exist yet (§10.6) |
 | `/build/eg2-bench/bench-quality/grep_baseline.json` | `{"small_rs": 0.95, "small_ts": 0.975}` — the grep control in §10.5 |
 | `/build/worktrees/graft_src/eg2-fusion-ab` | the implementation worktree, on `d4ec9d7` (v0.8.2). **Not merged.** 517/517 tests pass there; the branch is `ab/vector-fusion` |
+| `/build/worktrees/graft_src/eg2-ab-7980` | the §10.8 port worktree, on `7b8acc5` (v0.9.0), branch `ab/vector-fusion-7980` at `c0e3c08`. **Not merged.** 669/669 tests pass there; the blend line keeps the base's `testFactor` / `rankFactor` multiply (§10.8.6) |
+| `/build/eg2-bench/ab7980/ask-ab.mts` | the §10.8 A/B driver — the `d4ec9d7` driver with the distinct-file scoring fix. `diff -u` against `ab/ask-ab.mts` is four hunks: the import path, the scoring line, and two count-reporting additions |
+| `/build/eg2-bench/ab7980/ab-results.json`, `ab-run.txt` | the §10.8 7-arm sweep, pooled table |
+| `/build/eg2-bench/ab7980/per-query.json` | 240 rows × full ranked node lists for arm A and all six weights on `7b8acc5` — the substrate for every §10.8 number |
+| `/build/eg2-bench/ab7980/docverify/recompute.py` | §10.8's independent recomputation from `per-query.json`: distinct-file and entry-level file hit@k, node hit@5, MRR@10, per-query flip isolation, and the top-50 enter/exit analysis. Imports nothing from the run's own analysis |
+| `/build/eg2-bench/ab7980/docverify/crossbase.py` | the §10.8.4 paired cross-base comparison (`ab/per-query.json` vs `ab7980/per-query.json`), arm A's cross-base movement, and the oracle-independence check (240 rows / 237 distinct keys) |
+| `/build/eg2-bench/ab7980/parity.mts`, `parity.json` | flag-off byte-identity against a pristine `7b8acc5` export — `{"n":240,"diff":0,"nonEmpty":240}` |
+| `/build/eg2-bench/ab7980/validate-sidecars.py` | sidecar-vs-graph check on `7b8acc5`; `ALL SIDECARS VALID`, exit 0 |
+| `/build/eg2-bench/ab7980/full-tests.txt` | the ported suite's captured output — `tests 669 / pass 669 / fail 0` |
 
 Verification commands run while writing this document (all numbers above
 re-checked against artifacts): census totals from `census_results.json`
@@ -882,3 +1233,8 @@ re-checked against artifacts): census totals from `census_results.json`
 2,304,000-byte bins); the three-way cosine agreement computation over
 `bench-gpu/*.npy` reproduced §5.4 exactly; head-only chunk recount
 (1,616/1,671) reconciled with the per-class counts (1,508+108, 1,540+131).
+For §10.8: `docverify/recompute.py` and `docverify/crossbase.py` re-derived
+every sweep, flip, top-50 and cross-base number from the raw dumps and
+reproduced the driver's pooled table digit for digit, including §10.1-§10.4's
+`d4ec9d7` figures; `validate-sidecars.py` re-run to exit 0; the §10.8.6 blend
+lines read directly out of the port worktree with `grep -n`.
